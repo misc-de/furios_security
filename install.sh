@@ -25,11 +25,20 @@ fi
 # Checked before anything is installed. secctl without nft is a program that
 # can report and can harden two thirds - which is worth saying up front
 # rather than discovering at the switch.
+#
+# Looked for on PATH *and* in /usr/sbin. These are administrator tools and a
+# non-login shell on this phone does not carry /usr/sbin - checking with
+# "command -v" alone reported nftables missing on a phone that has it, which
+# is a refusal to install over nothing at all.
+have() {
+    command -v "$1" >/dev/null && return 0
+    [ -x "/usr/sbin/$1" ] || [ -x "/sbin/$1" ]
+}
+
 missing=()
-command -v nft >/dev/null || missing+=("nft (Paket nftables)")
-command -v ss >/dev/null || missing+=("ss (Paket iproute2)")
-[ -x /usr/sbin/modprobe ] || command -v modprobe >/dev/null \
-    || missing+=("modprobe (Paket kmod)")
+have nft      || missing+=("nft (Paket nftables)")
+have ss       || missing+=("ss (Paket iproute2)")
+have modprobe || missing+=("modprobe (Paket kmod)")
 if [ ${#missing[@]} -gt 0 ]; then
     printf 'Missing: %s\n' "${missing[@]}" >&2
     echo "Nothing was installed." >&2
