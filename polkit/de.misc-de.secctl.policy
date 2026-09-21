@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 misc-de
+     SPDX-License-Identifier: MIT -->
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+
+<!-- Lets the three switches in the app do what "sudo secctl" does from a
+     terminal.
+
+     allow_active is "yes", and in a security tool that deserves an argument
+     rather than a shrug.
+
+     There is nobody to ask. Phosh registers no polkit authentication agent,
+     so an action set to auth_admin cannot put a prompt on any screen -
+     pkexec fails outright and the switch becomes a control that does
+     nothing. The sibling projects hit this before us; modemctl's policy
+     carries the same note.
+
+     What it grants is bounded by secctl itself, which is the part that
+     matters. The program takes no path, no rule and no sysctl from its
+     caller: the three parts are compiled in, the only value that comes from
+     outside is a network in CIDR form, and it is rejected unless it parses
+     as exactly that. There is no "secctl run", no shell and no way to point
+     it at a different file. So the capability handed to the session is
+     "turn our own three parts on or off", not "edit /etc as root".
+
+     And the person this is granted to is the person holding the phone, who
+     can already reboot it into fastboot. The attacker this whole project is
+     about is remote or is unprivileged code in a session - and
+     allow_inactive is "no", so an SSH login gets nothing from this. That is
+     not a hope: polkit counts an SSH session as inactive, which the sibling
+     project verified on this phone with pkcheck against the session process.
+
+     allow_any stays at auth_admin so that anything which is neither of those
+     two still has to authenticate. -->
+
+<policyconfig>
+  <vendor>misc-de</vendor>
+  <vendor_url>https://github.com/misc-de/furios_security</vendor_url>
+
+  <action id="de.misc-de.secctl.manage">
+    <description>Change the hardening of this phone</description>
+    <description xml:lang="de">Härtung dieses Telefons ändern</description>
+    <message>Turning the kernel hardening, the module blocks or the firewall on or off</message>
+    <message xml:lang="de">Kernel-Härtung, Modulsperren oder Firewall ein- oder ausschalten</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 misc-de
+# SPDX-License-Identifier: MIT
+#
+# The suite, on every push.
+#
+# It needs no phone, no root and no network: everything the program touches
+# is a path under a temporary directory, and every external program is
+# stubbed at the one function all of them go through. So an ordinary x86
+# runner can say whether the last commit still holds.
+#
+# What a runner cannot say is whether the FIREWALL still lets the right
+# packets through. That is measured on the device, with a second machine, and
+# FINDINGS.md says so in the same words.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tools the suite looks for
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck nftables iproute2
+
+      - name: Run it
+        run: |
+          set -o pipefail
+          ./tests/run-tests.sh 2>&1 | tee /tmp/suite.log
+
+      - name: Only root may be missing here
+        run: |
+          # One skip is honest and expected: "nft -c" opens netlink even to
+          # check a file, so it needs root, and this suite must never run as
+          # root. Every other skip means a tool the step above was supposed
+          # to install is absent - and a check that silently does not run is
+          # worse than one that fails.
+          if grep -Eni 'no shellcheck|no nft$' /tmp/suite.log; then
+              echo "::error::a check was skipped for want of a tool - install it in the step above"
+              exit 1
+          fi

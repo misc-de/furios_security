@@ -1,0 +1,28 @@
+This project contains only code of our own (MIT, see LICENSE).
+
+At runtime it drives, without patching or replacing any of them:
+  - nftables (GPL-2.0) - the ruleset is generated and handed to "nft -f";
+    the table is our own and no other table is touched
+  - systemd (LGPL-2.1+), to enable nftables.service and read its state
+  - procps-ng sysctl (GPL-2.0+), to load /etc/sysctl.d and read values back
+  - kmod modprobe (LGPL-2.1+), asked what it WOULD do; nothing is loaded
+  - iproute2 ss and ip (GPL-2.0+), read-only, for the listening sockets and
+    the address of the wireless interface
+  - polkit (LGPL-2.0+), which carries the action that lets the app's
+    switches act without a password for the session at the device
+
+It writes, and puts every one of them back on revert:
+  - /etc/sysctl.d/99-furios-hardening.conf
+  - /etc/modprobe.d/99-furios-hardening.conf
+  - /etc/furios-security/ (the generated ruleset, the config, the state and
+    a copy of whatever /etc/nftables.conf was before)
+  - /etc/nftables.conf, which nftables.service reads and which therefore
+    cannot be anywhere else
+
+It reads, without changing them:
+  - /proc/sys/... for the current value of every sysctl it sets
+  - /proc/sys/kernel/osrelease, to know which kernel this is
+
+No part of FuriOS is patched or replaced, and no file belonging to anybody
+else is deleted: a file at one of our paths that does not carry our marker is
+reported and left where it is.

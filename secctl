@@ -1,0 +1,863 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 misc-de
+# SPDX-License-Identifier: MIT
+"""Three locks for a kernel that stopped getting security fixes.
+
+This phone runs 4.19.325, and that is not merely old: it is the LAST release
+of the 4.19 series. Upstream declared it end of life in December 2024 and has
+published nothing for it since. FuriLabs carries the tree on, but the package
+changelog of 4.19.325+furios8 holds no CVE reference and no stable merge -
+what arrives there are feature backports (openat2, close_range, the new mount
+API) so that a current Debian userland runs at all, plus MediaTek and clang
+fixes.
+
+A newer kernel is not on offer and cannot casually be built: binder,
+hwcomposer, the audio HAL and the modem driver are all compiled against this
+BSP. CIP maintains a 4.19.325-cip series with security backports until 2029,
+which is the one real way out, but it is a rebase of somebody's Android fork
+and not something a phone does to itself.
+
+So the holes stay. What can be taken away is the ROUTE to them, and that is
+the whole of what this program does:
+
+  sysctl    unprivileged BPF off, kernel pointers and dmesg closed, ptrace
+            limited to one's own children
+  modules   the kernel stops auto-loading protocol families and filesystems
+            that nothing here uses - a socket(AF_TIPC, ...) from any process
+            was enough to pull in a driver nobody has looked at in years
+  firewall  one input chain defaulting to drop, so what listens on this phone
+            is reachable from the local network and not from the carrier's
+
+Not one of those fixes a vulnerability. They make the cheap paths to one
+expensive, which for an EOL kernel is the honest goal. What is left after all
+three - the Bluetooth stack in radio range, and whatever a compromised
+browser can reach locally - is written down in FINDINGS.md rather than
+papered over here.
+
+Each part switches on its own and each goes away again cleanly, because a
+security tool that cannot be undone is one people are afraid to try.
+
+Root is needed to change anything: this writes /etc and talks to nftables.
+Reading the state needs none.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+# ---------------------------------------------------------------- paths
+#
+# Everything is built from one root so the tests can run against a temporary
+# directory rather than the phone they are running on. That is not a nicety:
+# a suite that reaches the real /etc/nftables.conf would take the firewall
+# off the device it is testing, and the sibling project has a finding about a
+# test that read the real /etc past its own stub.
+ROOT = os.environ.get("FURIOS_SECURITY_ROOT", "/")
+PROC = os.environ.get("FURIOS_SECURITY_PROC", os.path.join(ROOT, "proc"))
+
+
+def _p(*parts):
+    return os.path.join(ROOT, *[p.lstrip("/") for p in parts])
+
+
+SYSCTL_FILE = _p("etc/sysctl.d/99-furios-hardening.conf")
+MODPROBE_FILE = _p("etc/modprobe.d/99-furios-hardening.conf")
+STATE_DIR = _p("etc/furios-security")
+FIREWALL_FILE = os.path.join(STATE_DIR, "firewall.nft")
+CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+NFT_CONF = _p("etc/nftables.conf")
+NFT_BACKUP = os.path.join(STATE_DIR, "nftables.conf.orig")
+
+# The programs this drives. Constants rather than bare names so a test can
+# point them at a stub, and absolute so a changed PATH cannot decide which
+# "nft" writes the firewall of this phone.
+NFT = os.environ.get("FURIOS_SECURITY_NFT", "/usr/sbin/nft")
+SYSTEMCTL = os.environ.get("FURIOS_SECURITY_SYSTEMCTL", "/usr/bin/systemctl")
+SYSCTL = os.environ.get("FURIOS_SECURITY_SYSCTL", "/usr/sbin/sysctl")
+MODPROBE = os.environ.get("FURIOS_SECURITY_MODPROBE", "/usr/sbin/modprobe")
+SS = os.environ.get("FURIOS_SECURITY_SS", "/usr/bin/ss")
+IP = os.environ.get("FURIOS_SECURITY_IP", "/usr/bin/ip")
+
+# How our files are recognised as ours. Checked before anything is
+# overwritten or deleted - a file somebody else wrote to the same path is
+# reported, never removed.
+MARKER = "furios-security: managed file"
+
+PARTS = ("sysctl", "modules", "firewall")
+
+# ---------------------------------------------------------------- what we set
+#
+# Ordered, with the reason attached, because the reason is what somebody
+# needs a year from now when one of these breaks a program and the question
+# is whether it may go.
+SYSCTLS = [
+    ("kernel.unprivileged_bpf_disabled", "1",
+     "unprivileged BPF is a classic local privilege escalation path on 4.19"),
+    ("net.core.bpf_jit_harden", "2",
+     "makes JIT spraying harder for the BPF that is still allowed"),
+    ("kernel.dmesg_restrict", "1",
+     "the kernel ring buffer leaks addresses that defeat KASLR"),
+    ("kernel.kptr_restrict", "2",
+     "same reason, for pointers printed through /proc"),
+    ("kernel.perf_event_paranoid", "3",
+     "perf has its own history of privilege escalation bugs"),
+    ("kernel.yama.ptrace_scope", "1",
+     "a compromised process can no longer attach to its siblings"),
+]
+
+# Modules blocked from AUTO-loading. Not "blacklist": that only covers alias
+# resolution, and the kernel reaches these through a socket family or a mount
+# anyway. "install ... /bin/true" is what actually stops it.
+#
+# Nothing in this list is used by this phone, and each group is here for a
+# different reason.
+MODULE_GROUPS = [
+    ("protocol families", [
+        "rds", "tipc", "x25", "atm", "can", "appletalk",
+    ], "any process could load these with a single socket() call, and they "
+       "are among the most productive sources of 4.19 local exploits"),
+    ("line disciplines and legacy devices", [
+        "n_hdlc", "ppdev",
+    ], "reachable from a terminal, maintained by nobody"),
+    ("filesystems for removable media", [
+        "cramfs", "freevxfs", "jffs2", "hfs", "hfsplus", "udf",
+    ], "auto-loaded when a stick with that filesystem is plugged in, and "
+       "parsing an untrusted image is how those bugs are reached"),
+]
+
+BLOCKED_MODULES = [name for _, names, _ in MODULE_GROUPS for name in names]
+
+DEFAULT_CONFIG = {
+    # Which network the phone is at home in, and the interface it is on.
+    # Everything about the firewall that is not the same on every phone is
+    # these two values - they are asked for rather than guessed, because a
+    # wrong guess here either locks somebody out of their own phone or leaves
+    # the port open they wanted closed.
+    "lan": "",
+    "iface": "wlan0",
+    # Reachable from the local network when the firewall is on. Deliberately
+    # short and deliberately not "whatever is listening": the point of the
+    # chain is that a service which starts listening tomorrow does not become
+    # reachable by doing so.
+    "allow_ssh": True,
+    "allow_mdns": True,
+}
+
+
+# ---------------------------------------------------------------- plumbing
+
+
+def run(argv, stdin=None):
+    """One place where this program leaves its own process.
+
+    Bounded, output merged, never raising: a helper that is missing or hangs
+    is a state to report, not a traceback. nft in particular is absent on a
+    phone where nftables was never installed, and "status" has to survive
+    that and say so.
+    """
+    try:
+        proc = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, timeout=20)
+        return proc.returncode, proc.stdout or ""
+    except FileNotFoundError:
+        return 127, "%s: not installed" % argv[0]
+    except (OSError, subprocess.SubprocessError) as err:
+        return 1, str(err)
+
+
+def is_root():
+    return os.geteuid() == 0
+
+
+def need_root(what):
+    if is_root():
+        return True
+    say("%s needs root: sudo secctl %s" % (what, what))
+    return False
+
+
+def say(*text):
+    print(*text)
+
+
+def read_file(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def write_file(path, text, mode=0o644):
+    """Write it whole or not at all.
+
+    Through a temporary file in the same directory and a rename, because the
+    two files this writes are read by the kernel and by nftables at boot, and
+    half of either is worse than neither.
+    """
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    tmp = path + ".new"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def ours(path):
+    """Did we write this file? Nothing is overwritten or removed without it."""
+    text = read_file(path)
+    return text is not None and MARKER in text
+
+
+def load_json(path, fallback):
+    text = read_file(path)
+    if not text:
+        return dict(fallback)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return dict(fallback)
+    merged = dict(fallback)
+    merged.update({k: v for k, v in data.items() if k in fallback} if fallback
+                  else data)
+    return merged
+
+
+def config():
+    return load_json(CONFIG_FILE, DEFAULT_CONFIG)
+
+
+def state():
+    return load_json(STATE_FILE, {"nftables_was_enabled": None})
+
+
+def save_state(data):
+    write_file(STATE_FILE, json.dumps(data, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------- guessing
+#                                                                   the LAN
+
+def guess_lan():
+    """The network this phone is currently on, as a /24, or "".
+
+    Only ever a SUGGESTION - it is printed and has to be confirmed with
+    "secctl lan". Deriving it silently would mean the rule that decides who
+    may reach SSH is written from whichever Wi-Fi somebody happened to be on
+    when they pressed the switch.
+    """
+    iface = config()["iface"]
+    rc, out = run([IP, "-4", "-brief", "addr", "show", "dev", iface])
+    if rc != 0:
+        return ""
+    match = re.search(r"(\d+\.\d+\.\d+)\.\d+/(\d+)", out)
+    if not match:
+        return ""
+    return "%s.0/%s" % (match.group(1), match.group(2))
+
+
+def valid_cidr(text):
+    match = re.fullmatch(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})",
+                         (text or "").strip())
+    if not match:
+        return False
+    parts = [int(g) for g in match.groups()]
+    return all(p <= 255 for p in parts[:4]) and parts[4] <= 32
+
+
+# ---------------------------------------------------------------- sysctl part
+
+
+def sysctl_text():
+    lines = ["# %s" % MARKER,
+             "# SPDX-FileCopyrightText: Copyright (c) 2026 misc-de",
+             "# SPDX-License-Identifier: MIT",
+             "#",
+             "# Kernel 4.19 has been end of life since December 2024. These",
+             "# close the cheap routes to a local privilege escalation; they",
+             "# do not fix one.",
+             "#",
+             "# Undo:  sudo secctl revert sysctl",
+             ""]
+    for key, value, why in SYSCTLS:
+        lines.append("# %s" % why)
+        lines.append("%s = %s" % (key, value))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def sysctl_live(key):
+    """What the kernel says right now, or None when it will not say.
+
+    net.core.bpf_jit_harden is readable by root only, so None here is an
+    ordinary answer and not a fault - it is reported as "not readable"
+    rather than guessed from the file we wrote.
+    """
+    path = os.path.join(PROC, "sys", key.replace(".", "/"))
+    text = read_file(path)
+    return text.strip() if text is not None else None
+
+
+def sysctl_state():
+    keys = {}
+    for key, want, why in SYSCTLS:
+        have = sysctl_live(key)
+        keys[key] = {"want": want, "is": have, "why": why,
+                     "ok": None if have is None else have == want}
+    answered = [k["ok"] for k in keys.values() if k["ok"] is not None]
+    return {
+        "file": os.path.exists(SYSCTL_FILE),
+        "ours": ours(SYSCTL_FILE),
+        "keys": keys,
+        "state": ("on" if answered and all(answered)
+                  else "off" if not any(answered)
+                  else "partial"),
+    }
+
+
+def sysctl_apply():
+    write_file(SYSCTL_FILE, sysctl_text())
+    rc, out = run([SYSCTL, "-q", "--system"])
+    # sysctl --system walks every file in /etc/sysctl.d, so a complaint from
+    # somebody else's is not this failing. Only our own keys decide.
+    bad = [k for k, v in sysctl_state()["keys"].items()
+           if v["ok"] is False]
+    if bad:
+        say("did not take effect: " + ", ".join(bad))
+        if out.strip():
+            say(out.strip())
+        return 1
+    return 0
+
+
+def sysctl_revert():
+    """The file goes, and the values go back to what the kernel boots with.
+
+    Not every one of them can: kernel.unprivileged_bpf_disabled is one-way on
+    4.19 - once set it cannot be cleared without a reboot, by design, so that
+    an exploit cannot undo it either. That is said plainly rather than
+    reported as a failure.
+    """
+    if os.path.exists(SYSCTL_FILE) and not ours(SYSCTL_FILE):
+        say("%s was not written by us - left alone." % SYSCTL_FILE)
+        return 1
+    if os.path.exists(SYSCTL_FILE):
+        os.unlink(SYSCTL_FILE)
+    stuck = []
+    for key, want, _why in SYSCTLS:
+        if key == "kernel.unprivileged_bpf_disabled":
+            if sysctl_live(key) == "1":
+                stuck.append(key)
+            continue
+        run([SYSCTL, "-q", "-w", "%s=0" % key])
+    run([SYSCTL, "-q", "--system"])
+    if stuck:
+        say("still on until the next boot (the kernel will not let it be "
+            "cleared): " + ", ".join(stuck))
+    return 0
+
+
+# ---------------------------------------------------------------- modules part
+
+
+def modprobe_text():
+    lines = ["# %s" % MARKER,
+             "# SPDX-FileCopyrightText: Copyright (c) 2026 misc-de",
+             "# SPDX-License-Identifier: MIT",
+             "#",
+             "# Stops the kernel AUTO-loading these. Not \"blacklist\": that",
+             "# only covers alias resolution, and the kernel reaches a",
+             "# protocol family through socket() and a filesystem through",
+             "# mount() regardless. \"install ... /bin/true\" is what holds.",
+             "#",
+             "# Undo:  sudo secctl revert modules",
+             ""]
+    for title, names, why in MODULE_GROUPS:
+        lines.append("# %s - %s" % (title, why))
+        for name in names:
+            lines.append("install %s /bin/true" % name)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def module_blocked(name):
+    """Would the kernel load this module if something asked for it?
+
+    Asked of modprobe rather than of our own file, because the answer that
+    matters is the one the kernel will act on - another file in
+    /etc/modprobe.d can override ours, and then the block we wrote is a block
+    that does not exist.
+    """
+    rc, out = run([MODPROBE, "-n", "-v", name])
+    if rc != 0:
+        # Not installed, or modprobe is missing. Either way nothing can be
+        # said about this name, and saying nothing is the honest answer.
+        return None
+    return "/bin/true" in out
+
+
+def modules_state():
+    blocked = {}
+    for name in BLOCKED_MODULES:
+        blocked[name] = module_blocked(name)
+    answered = [v for v in blocked.values() if v is not None]
+    return {
+        "file": os.path.exists(MODPROBE_FILE),
+        "ours": ours(MODPROBE_FILE),
+        "modules": blocked,
+        "count": len(BLOCKED_MODULES),
+        "state": ("on" if answered and all(answered)
+                  else "off" if not any(answered)
+                  else "partial"),
+    }
+
+
+def modules_apply():
+    write_file(MODPROBE_FILE, modprobe_text())
+    return 0
+
+
+def modules_revert():
+    if os.path.exists(MODPROBE_FILE) and not ours(MODPROBE_FILE):
+        say("%s was not written by us - left alone." % MODPROBE_FILE)
+        return 1
+    if os.path.exists(MODPROBE_FILE):
+        os.unlink(MODPROBE_FILE)
+    return 0
+
+
+# ---------------------------------------------------------------- firewall part
+
+
+def firewall_text(cfg=None):
+    """The ruleset, generated from the config rather than shipped as a file.
+
+    Two things in it are this phone's and nobody else's - the network it is
+    at home in and the interface that faces it - and a rule about who may
+    reach SSH is the last place for a value somebody has to remember to edit.
+
+    The three lines at the top are the idiom that makes this safe to load
+    twice: create the table if it is not there, delete it, define it. Without
+    them a second "nft -f" appends its rules to the ones already in the chain
+    and the ruleset grows every time. Flushing the whole ruleset instead -
+    which is what Debian's own nftables.conf does - would take LXC's tables
+    down with it.
+    """
+    cfg = cfg or config()
+    lan, iface = cfg["lan"], cfg["iface"]
+    out = ["#!/usr/sbin/nft -f",
+           "# %s" % MARKER,
+           "# SPDX-FileCopyrightText: Copyright (c) 2026 misc-de",
+           "# SPDX-License-Identifier: MIT",
+           "#",
+           "# Generated by secctl - edit the config, not this file:",
+           "#   sudo secctl lan <cidr>",
+           "#",
+           "# Undo:  sudo secctl revert firewall",
+           "",
+           "table inet furios",
+           "delete table inet furios",
+           "",
+           "table inet furios {",
+           "\tchain input {",
+           "\t\ttype filter hook input priority filter; policy drop;",
+           "",
+           "\t\tct state established,related accept",
+           "\t\tct state invalid drop",
+           "\t\tiif lo accept",
+           "",
+           "\t\t# ICMP and neighbour discovery - without these PMTU breaks",
+           "\t\t# and IPv6 stops working altogether",
+           "\t\tmeta l4proto { icmp, ipv6-icmp } accept",
+           "",
+           "\t\t# our own bridges: LXC, and the hotspot when it is up",
+           "\t\tiifname { \"lxcbr0\", \"ap0\" } accept",
+           "",
+           "\t\t# DHCP client, v4 and v6",
+           "\t\tudp dport { 68, 546 } accept",
+           ""]
+    if lan and cfg.get("allow_ssh"):
+        out += ["\t\t# SSH from the home network only - never over mobile",
+                "\t\tiifname \"%s\" ip saddr %s tcp dport 22 accept" % (iface, lan),
+                ""]
+    if lan and cfg.get("allow_mdns"):
+        out += ["\t\t# mDNS, for printers and discovery on that same network",
+                "\t\tiifname \"%s\" ip saddr %s udp dport 5353 accept" % (iface, lan),
+                ""]
+    out += ["\t\tcounter comment \"dropped\"",
+            "\t}",
+            "}",
+            ""]
+    return "\n".join(out)
+
+
+def nft_conf_text():
+    """What goes to /etc/nftables.conf.
+
+    nftables.service reads that one path and no other, so our ruleset has to
+    be named there. It deliberately does NOT begin with "flush ruleset" the
+    way Debian's default does: the included file replaces its own table with
+    the create/delete/define idiom and leaves everybody else's alone - LXC
+    puts its NAT tables up later in the boot and they have to survive this.
+    """
+    return "\n".join([
+        "#!/usr/sbin/nft -f",
+        "# %s" % MARKER,
+        "#",
+        "# Written by secctl. The file that was here before is kept at",
+        "#   %s" % NFT_BACKUP,
+        "# and put back by:  sudo secctl revert firewall",
+        "",
+        "include \"%s\"" % FIREWALL_FILE,
+        "",
+    ])
+
+
+def firewall_live():
+    """Is our table loaded right now?
+
+    None when the question cannot be asked - nft needs root to list a table,
+    so an unprivileged "status" reports what is configured and says the live
+    state is unknown rather than inventing one.
+    """
+    if not is_root():
+        return None
+    rc, _out = run([NFT, "list", "table", "inet", "furios"])
+    return rc == 0
+
+
+def service_enabled():
+    rc, out = run([SYSTEMCTL, "is-enabled", "nftables"])
+    text = out.strip()
+    if text in ("enabled", "enabled-runtime"):
+        return True
+    if text in ("disabled", "masked", "static"):
+        return False
+    return None if rc == 127 else False
+
+
+def firewall_state():
+    cfg = config()
+    return {
+        "file": os.path.exists(FIREWALL_FILE),
+        "ours": ours(FIREWALL_FILE),
+        "conf": ours(NFT_CONF),
+        "service": service_enabled(),
+        "live": firewall_live(),
+        "lan": cfg["lan"],
+        "iface": cfg["iface"],
+        "state": ("on" if ours(FIREWALL_FILE) and ours(NFT_CONF)
+                  and service_enabled() else "off"),
+    }
+
+
+def firewall_apply():
+    cfg = config()
+    if not valid_cidr(cfg["lan"]):
+        guess = guess_lan()
+        say("The firewall needs to know which network this phone is at home "
+            "in -\nwithout it, turning it on would cut SSH from your own "
+            "machine too.")
+        if guess:
+            say("\nThis looks like:  sudo secctl lan %s" % guess)
+        else:
+            say("\nSet it with:      sudo secctl lan 192.168.0.0/24")
+        return 1
+
+    write_file(FIREWALL_FILE, firewall_text(cfg))
+
+    # The file that was there before is kept once, and only if somebody else
+    # wrote it. Backing up our own on every apply would overwrite the real
+    # original with a copy of ours the second time around.
+    if os.path.exists(NFT_CONF) and not ours(NFT_CONF) \
+            and not os.path.exists(NFT_BACKUP):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        write_file(NFT_BACKUP, read_file(NFT_CONF) or "")
+    write_file(NFT_CONF, nft_conf_text())
+
+    # Remember whether the service was somebody else's business before we
+    # enabled it, so that revert leaves the phone the way it found it.
+    st = state()
+    if st.get("nftables_was_enabled") is None:
+        st["nftables_was_enabled"] = service_enabled()
+        save_state(st)
+
+    rc, out = run([NFT, "-f", FIREWALL_FILE])
+    if rc != 0:
+        say("nft refused the ruleset - nothing is loaded:")
+        say(out.strip())
+        return 1
+    rc, out = run([SYSTEMCTL, "enable", "nftables"])
+    if rc != 0:
+        say("Loaded, but it will not come back after a reboot:")
+        say(out.strip())
+        return 1
+    return 0
+
+
+def firewall_revert():
+    if os.path.exists(FIREWALL_FILE) and not ours(FIREWALL_FILE):
+        say("%s was not written by us - left alone." % FIREWALL_FILE)
+        return 1
+    run([NFT, "delete", "table", "inet", "furios"])
+    if os.path.exists(FIREWALL_FILE):
+        os.unlink(FIREWALL_FILE)
+
+    if ours(NFT_CONF):
+        original = read_file(NFT_BACKUP)
+        if original is not None:
+            write_file(NFT_CONF, original)
+            os.unlink(NFT_BACKUP)
+        else:
+            os.unlink(NFT_CONF)
+
+    st = state()
+    if st.get("nftables_was_enabled") is False:
+        run([SYSTEMCTL, "disable", "nftables"])
+    st["nftables_was_enabled"] = None
+    save_state(st)
+    return 0
+
+
+# ---------------------------------------------------------------- the whole
+
+APPLY = {"sysctl": sysctl_apply, "modules": modules_apply,
+         "firewall": firewall_apply}
+REVERT = {"sysctl": sysctl_revert, "modules": modules_revert,
+          "firewall": firewall_revert}
+STATE = {"sysctl": sysctl_state, "modules": modules_state,
+         "firewall": firewall_state}
+
+
+def kernel_facts():
+    """Why this program exists, in four values the app can print.
+
+    Read rather than hard-coded, except the two dates: a phone that one day
+    boots something newer should say so here instead of repeating a warning
+    that has stopped being true.
+    """
+    release = (read_file(os.path.join(PROC, "sys/kernel/osrelease")) or "").strip()
+    base = re.match(r"(\d+\.\d+\.\d+)", release)
+    base = base.group(1) if base else release
+    series = ".".join(base.split(".")[:2])
+    return {
+        "release": release,
+        "base": base,
+        "series": series,
+        # 4.19.325 was the final 4.19 release; the series went end of life
+        # with it. Both are facts about upstream, not about this phone.
+        "eol": "2024-12-05" if series == "4.19" else None,
+        "last_release": "4.19.325" if series == "4.19" else None,
+        "maintained": series != "4.19",
+    }
+
+
+def exposure():
+    """What listens where - the one reading that says whether the firewall is
+    doing anything.
+
+    Only sockets bound to something other than loopback are counted: a port
+    on 127.0.0.1 is not reachable from any network with or without a chain,
+    and listing it would pad the answer with things nobody needs to act on.
+    """
+    rc, out = run([SS, "-tulnH"])
+    if rc != 0:
+        return {"readable": False, "open": []}
+    found = []
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) < 5:
+            continue
+        local = cols[4]
+        addr, _, port = local.rpartition(":")
+        # "0.0.0.0%lxcbr0" - ss names the interface a socket is bound to
+        # right in the address, and it is noise in a list of addresses.
+        addr = addr.strip("[]").split("%")[0]
+        if addr in ("127.0.0.1", "::1") or addr.startswith("127."):
+            continue
+        entry = {"proto": cols[0], "addr": addr, "port": port,
+                 "any": addr in ("0.0.0.0", "*", "::")}
+        if entry not in found:
+            found.append(entry)
+    return {"readable": True, "open": found}
+
+
+def overall(parts):
+    values = [parts[name]["state"] for name in PARTS]
+    if all(v == "on" for v in values):
+        return "on"
+    if all(v == "off" for v in values):
+        return "off"
+    return "partial"
+
+
+def status(as_json=False):
+    parts = {name: STATE[name]() for name in PARTS}
+    data = {"kernel": kernel_facts(), "parts": parts,
+            "exposure": exposure(), "state": overall(parts),
+            "root": is_root()}
+    if as_json:
+        say(json.dumps(data, indent=2))
+        return 0
+
+    kern = data["kernel"]
+    say("Kernel   %s" % kern["release"])
+    if not kern["maintained"]:
+        say("         %s was the last release of %s; end of life %s."
+            % (kern["last_release"], kern["series"], kern["eol"]))
+        say("         No upstream security fixes since then.")
+    say("")
+
+    sysctl = parts["sysctl"]
+    say("sysctl   %s" % sysctl["state"])
+    for key, info in sysctl["keys"].items():
+        mark = "ok " if info["ok"] else "   " if info["ok"] is None else "OFF"
+        shown = info["is"] if info["is"] is not None else "not readable (root)"
+        say("  %s %-38s %s" % (mark, key, shown))
+
+    mods = parts["modules"]
+    unknown = sum(1 for v in mods["modules"].values() if v is None)
+    blocked = sum(1 for v in mods["modules"].values() if v)
+    say("")
+    say("modules  %s  (%d of %d blocked%s)"
+        % (mods["state"], blocked, mods["count"],
+           ", %d unanswered" % unknown if unknown else ""))
+
+    fw = parts["firewall"]
+    say("")
+    say("firewall %s" % fw["state"])
+    say("  rules at boot   %s" % ("yes" if fw["conf"] and fw["service"]
+                                  else "no"))
+    say("  loaded now      %s" % ("yes" if fw["live"] else "no"
+                                  if fw["live"] is False else
+                                  "not readable without root"))
+    say("  home network    %s" % (fw["lan"] or "not set - see: secctl lan"))
+
+    exp = data["exposure"]
+    say("")
+    if not exp["readable"]:
+        say("listening ports could not be read")
+    elif not exp["open"]:
+        say("nothing listens outside loopback")
+    else:
+        say("listening beyond loopback:")
+        for entry in exp["open"]:
+            say("  %-4s %s:%s%s" % (entry["proto"], entry["addr"],
+                                    entry["port"],
+                                    "   (every interface)" if entry["any"]
+                                    else ""))
+        if fw["state"] == "on":
+            say("  - the chain lets through only what is listed above it; "
+                "the rest is dropped.")
+        else:
+            say("  - with the firewall off these are reachable from every "
+                "network this phone joins, mobile included.")
+    return 0
+
+
+def do(which, table, verb):
+    """apply/revert, for one part or all three.
+
+    Stops at the first failure and says which part that was. A half-applied
+    state reported as success is the one outcome a tool like this must not
+    produce - somebody would believe the firewall is up.
+    """
+    names = PARTS if which in (None, "all") else (which,)
+    for name in names:
+        if name not in table:
+            say("unknown part: %s (try: %s)" % (name, ", ".join(PARTS)))
+            return 2
+        rc = table[name]()
+        if rc != 0:
+            say("%s: %s did not go through - stopping here." % (verb, name))
+            return rc
+        say("%s: %s" % (verb, name))
+    return 0
+
+
+USAGE = """secctl - hardening for an end-of-life kernel
+
+  secctl status [--json]        what is on, what is off, what listens
+  secctl apply [part|all]       turn it on
+  secctl revert [part|all]      turn it off and put back what was there
+  secctl set <part> on|off      the same, as one switch (this is what the
+                                app's switches call)
+  secctl lan <cidr>             the network SSH may be reached from,
+                                e.g. 192.168.0.0/24 - "auto" to take the
+                                current one
+  secctl parts                  the three parts, one per line
+
+parts: %s
+
+Changing anything needs root. Reading does not.""" % ", ".join(PARTS)
+
+
+def main(argv):
+    args = list(argv[1:])
+    cmd = args.pop(0) if args else "status"
+
+    if cmd in ("-h", "--help", "help"):
+        say(USAGE)
+        return 0
+
+    if cmd == "status":
+        return status(as_json="--json" in args)
+
+    if cmd == "parts":
+        for name in PARTS:
+            say(name)
+        return 0
+
+    if cmd == "apply":
+        if not need_root("apply"):
+            return 1
+        return do(args[0] if args else "all", APPLY, "applied")
+
+    if cmd == "revert":
+        if not need_root("revert"):
+            return 1
+        return do(args[0] if args else "all", REVERT, "reverted")
+
+    if cmd == "set":
+        if len(args) != 2 or args[1] not in ("on", "off"):
+            say("usage: secctl set <%s> on|off" % "|".join(PARTS))
+            return 2
+        if not need_root("set"):
+            return 1
+        part, value = args
+        table, verb = (APPLY, "applied") if value == "on" else (REVERT,
+                                                                "reverted")
+        return do(part, table, verb)
+
+    if cmd == "lan":
+        if not args:
+            say(config()["lan"] or "not set")
+            return 0
+        if not need_root("lan"):
+            return 1
+        value = guess_lan() if args[0] == "auto" else args[0]
+        if not valid_cidr(value):
+            say("not a network in CIDR form: %s" % (args[0],))
+            say("expected something like 192.168.0.0/24")
+            return 2
+        cfg = config()
+        cfg["lan"] = value
+        write_file(CONFIG_FILE, json.dumps(cfg, indent=2) + "\n")
+        say("home network: %s" % value)
+        # Only rewrite a firewall that is already on. Setting the network is
+        # not the same as asking for the chain, and the grundregel here is
+        # that nothing switches itself on.
+        if ours(FIREWALL_FILE):
+            return firewall_apply()
+        return 0
+
+    say(USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
