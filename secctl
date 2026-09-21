@@ -633,29 +633,6 @@ STATE = {"sysctl": sysctl_state, "modules": modules_state,
          "firewall": firewall_state}
 
 
-def kernel_facts():
-    """Why this program exists, in four values the app can print.
-
-    Read rather than hard-coded, except the two dates: a phone that one day
-    boots something newer should say so here instead of repeating a warning
-    that has stopped being true.
-    """
-    release = (read_file(os.path.join(PROC, "sys/kernel/osrelease")) or "").strip()
-    base = re.match(r"(\d+\.\d+\.\d+)", release)
-    base = base.group(1) if base else release
-    series = ".".join(base.split(".")[:2])
-    return {
-        "release": release,
-        "base": base,
-        "series": series,
-        # 4.19.325 was the final 4.19 release; the series went end of life
-        # with it. Both are facts about upstream, not about this phone.
-        "eol": "2024-12-05" if series == "4.19" else None,
-        "last_release": "4.19.325" if series == "4.19" else None,
-        "maintained": series != "4.19",
-    }
-
-
 def exposure():
     """What listens where - the one reading that says whether the firewall is
     doing anything.
@@ -697,22 +674,11 @@ def overall(parts):
 
 def status(as_json=False):
     parts = {name: STATE[name]() for name in PARTS}
-    data = {"kernel": kernel_facts(), "parts": parts,
-            "exposure": exposure(), "state": overall(parts),
-            "root": is_root()}
+    data = {"parts": parts, "exposure": exposure(),
+            "state": overall(parts), "root": is_root()}
     if as_json:
         say(json.dumps(data, indent=2))
         return 0
-
-    kern = data["kernel"]
-    say("Kernel   %s" % kern["release"])
-    if not kern["maintained"]:
-        say("         %s was the last upstream release of %s; end of life %s."
-            % (kern["last_release"], kern["series"], kern["eol"]))
-        say("         No upstream security fixes since then. FuriLabs "
-            "still builds")
-        say("         this kernel, but with feature backports, not fixes.")
-    say("")
 
     sysctl = parts["sysctl"]
     say("sysctl   %s" % sysctl["state"])

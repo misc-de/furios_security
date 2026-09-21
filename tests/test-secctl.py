@@ -414,24 +414,10 @@ class Cli(Base):
             self.proc_sysctl(key, value)
         self.s.main(["secctl", "status", "--json"])
         data = json.loads("\n".join(self.said))
-        for field in ("kernel", "parts", "exposure", "state"):
+        for field in ("parts", "exposure", "state"):
             self.assertIn(field, data)
         for part in self.s.PARTS:
             self.assertIn("state", data["parts"][part])
-
-
-class KernelFacts(Base):
-    def test_419_is_reported_as_unmaintained(self):
-        self.proc_sysctl("kernel.osrelease", "4.19.325-furiphone-radon")
-        facts = self.s.kernel_facts()
-        self.assertFalse(facts["maintained"])
-        self.assertEqual(facts["eol"], "2024-12-05")
-
-    def test_a_newer_kernel_stops_the_warning(self):
-        """A phone that one day boots something maintained must not keep
-        repeating a warning that has stopped being true."""
-        self.proc_sysctl("kernel.osrelease", "6.12.3-furiphone")
-        self.assertTrue(self.s.kernel_facts()["maintained"])
 
 
 if __name__ == "__main__":
