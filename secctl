@@ -232,7 +232,8 @@ def config():
 
 
 def state():
-    return load_json(STATE_FILE, {"nftables_was_enabled": None})
+    return load_json(STATE_FILE, {"nftables_was_enabled": None,
+                                  "sysctl_before": None})
 
 
 def save_state(data):
@@ -320,6 +321,13 @@ def sysctl_state():
 
 
 def sysctl_apply():
+    # What the kernel had before our file, kept once so revert can put
+    # exactly that back. Not on a re-apply: the live values are ours then.
+    st = state()
+    if st.get("sysctl_before") is None and not ours(SYSCTL_FILE):
+        st["sysctl_before"] = {key: sysctl_live(key) for key, _v, _w in SYSCTLS
+                               if sysctl_live(key) is not None}
+        save_state(st)
     write_file(SYSCTL_FILE, sysctl_text())
     rc, out = run([SYSCTL, "-q", "--system"])
     # sysctl --system walks every file in /etc/sysctl.d, so a complaint from
@@ -347,17 +355,33 @@ def sysctl_revert():
         return 1
     if os.path.exists(SYSCTL_FILE):
         os.unlink(SYSCTL_FILE)
-    stuck = []
+    # Back to what was there before apply - not to 0. 0 is not what this
+    # kernel boots with: it has Yama's ptrace_scope at 1 and
+    # PERF_EVENTS_RESTRICT's perf_event_paranoid at 3, and writing 0 left a
+    # reverted phone more open than one that never had this installed.
+    # Without a record (applied by an older secctl) a value is left as it is;
+    # the boot after this puts the kernel's own back.
+    st = state()
+    before = st.get("sysctl_before") or {}
+    stuck, kept = [], []
     for key, want, _why in SYSCTLS:
         if key == "kernel.unprivileged_bpf_disabled":
-            if sysctl_live(key) == "1":
+            if sysctl_live(key) == "1" and before.get(key) != "1":
                 stuck.append(key)
             continue
-        run([SYSCTL, "-q", "-w", "%s=0" % key])
+        if key in before:
+            run([SYSCTL, "-q", "-w", "%s=%s" % (key, before[key])])
+        else:
+            kept.append(key)
     run([SYSCTL, "-q", "--system"])
+    st["sysctl_before"] = None
+    save_state(st)
     if stuck:
         say("still on until the next boot (the kernel will not let it be "
             "cleared): " + ", ".join(stuck))
+    if kept:
+        say("left as they are until the next boot (no record of what was "
+            "there before): " + ", ".join(kept))
     return 0
 
 

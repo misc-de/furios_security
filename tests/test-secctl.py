@@ -167,6 +167,44 @@ class SysctlRevert(Base):
                    if "kernel.unprivileged_bpf_disabled=0" in " ".join(c)]
         self.assertEqual(written, [])
 
+    def test_revert_puts_back_what_was_there_not_zero(self):
+        """This kernel boots with ptrace_scope 1 (Yama) and
+        perf_event_paranoid 3 (PERF_EVENTS_RESTRICT). Writing 0 left a
+        reverted phone more open than one that never had this."""
+        booted = {"kernel.yama.ptrace_scope": "1",
+                  "kernel.perf_event_paranoid": "3",
+                  "kernel.kptr_restrict": "0"}
+        for key, value in booted.items():
+            self.proc_sysctl(key, value)
+        self.s.sysctl_apply()
+        for key, value, _ in self.s.SYSCTLS:
+            self.proc_sysctl(key, value)
+        self.calls.clear()
+        self.s.sysctl_revert()
+        written = [c[-1] for c in self.calls if "-w" in c]
+        for key, value in booted.items():
+            self.assertIn("%s=%s" % (key, value), written)
+        self.assertNotIn("kernel.yama.ptrace_scope=0", written)
+        self.assertNotIn("kernel.perf_event_paranoid=0", written)
+
+    def test_a_second_apply_does_not_record_our_own_values(self):
+        self.proc_sysctl("kernel.yama.ptrace_scope", "1")
+        self.s.sysctl_apply()
+        self.proc_sysctl("kernel.yama.ptrace_scope", "1")
+        self.proc_sysctl("kernel.dmesg_restrict", "1")
+        self.s.sysctl_apply()
+        before = self.s.state()["sysctl_before"]
+        self.assertNotIn("kernel.dmesg_restrict", before)
+
+    def test_without_a_record_nothing_is_lowered(self):
+        """Applied by a secctl that kept no record: leave the values for the
+        next boot rather than guess 0."""
+        self.s.write_file(self.s.SYSCTL_FILE, self.s.sysctl_text())
+        for key, value, _ in self.s.SYSCTLS:
+            self.proc_sysctl(key, value)
+        self.s.sysctl_revert()
+        self.assertEqual([c for c in self.calls if "-w" in c], [])
+
 
 class Modules(Base):
     def test_install_true_not_blacklist(self):
