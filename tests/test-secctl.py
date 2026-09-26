@@ -353,6 +353,14 @@ class Cidr(Base):
         self.answers[(self.s.IP,)] = (0, "wlan0  UP  192.168.0.25/24 fe80::1/64\n")
         self.assertEqual(self.s.guess_lan(), "192.168.0.0/24")
 
+    def test_guess_is_the_network_the_phone_is_in(self):
+        """Not the first three octets with .0: on a /26 that is a network
+        the phone is not in, and SSH from the home machine is dropped."""
+        for line, want in (("wlan0  UP  192.168.1.200/26\n", "192.168.1.192/26"),
+                           ("wlan0  UP  10.20.30.40/16\n", "10.20.0.0/16")):
+            self.answers[(self.s.IP,)] = (0, line)
+            self.assertEqual(self.s.guess_lan(), want)
+
     def test_guess_says_nothing_when_it_cannot(self):
         self.answers[(self.s.IP,)] = (1, "Device does not exist")
         self.assertEqual(self.s.guess_lan(), "")

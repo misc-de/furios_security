@@ -41,6 +41,7 @@ Root is needed to change anything: this writes /etc and talks to nftables.
 Reading the state needs none.
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -255,10 +256,16 @@ def guess_lan():
     rc, out = run([IP, "-4", "-brief", "addr", "show", "dev", iface])
     if rc != 0:
         return ""
-    match = re.search(r"(\d+\.\d+\.\d+)\.\d+/(\d+)", out)
+    match = re.search(r"\d+\.\d+\.\d+\.\d+/\d+", out)
     if not match:
         return ""
-    return "%s.0/%s" % (match.group(1), match.group(2))
+    # The network the address is in, for its own prefix. Not "first three
+    # octets and .0": on a /25 or /26 that names a network the phone is not
+    # in, and the SSH rule written from it drops the home machine.
+    try:
+        return str(ipaddress.ip_interface(match.group(0)).network)
+    except ValueError:
+        return ""
 
 
 def valid_cidr(text):
