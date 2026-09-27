@@ -118,3 +118,18 @@ from here.
 The one measure that would actually close CVEs is a rebase onto
 `4.19.325-cip136`, which shares this exact base and carries security backports
 until 2029.
+
+## The firewall lived in a file that belongs to nftables (27.9.2026)
+
+`/etc/nftables.conf` is a conffile of the nftables package. secctl rewrote it
+to an include of our ruleset, so the next nftables update that ships a
+changed file would stop and ask which version to keep. The package's version
+turns the firewall off from the next boot, and nothing noticed: `status`
+read "rules at boot" from that same file.
+
+The ruleset now comes up from `furios-firewall.service`, a unit no package
+owns. It runs `After=nftables.service`, because the stock file begins with
+`flush ruleset`, and `PartOf=` it, so a package update that restarts nftables
+restarts us right behind it instead of leaving the phone without a table
+until the next boot. Its stop deletes our table only. Apply and revert both
+put an older rewrite back from `nftables.conf.orig`.

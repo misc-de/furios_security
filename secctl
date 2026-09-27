@@ -69,8 +69,15 @@ STATE_DIR = _p("etc/furios-security")
 FIREWALL_FILE = os.path.join(STATE_DIR, "firewall.nft")
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
+# Only read, and put back if an older secctl rewrote it: it is a conffile of
+# the nftables package, and changing it means a question in the middle of the
+# next nftables update - answered "the package's version", the firewall was
+# gone after the next boot and nothing said so.
 NFT_CONF = _p("etc/nftables.conf")
 NFT_BACKUP = os.path.join(STATE_DIR, "nftables.conf.orig")
+# Our own unit instead, which no package owns.
+UNIT_NAME = "furios-firewall.service"
+UNIT_FILE = _p("etc/systemd/system", UNIT_NAME)
 
 # The programs this drives. Constants rather than bare names so a test can
 # point them at a stub, and absolute so a changed PATH cannot decide which
@@ -526,26 +533,68 @@ def firewall_text(cfg=None):
     return "\n".join(out)
 
 
-def nft_conf_text():
-    """What goes to /etc/nftables.conf.
+def unit_text():
+    """Our own unit, so that nothing of a package's has to change.
 
-    nftables.service reads that one path and no other, so our ruleset has to
-    be named there. It deliberately does NOT begin with "flush ruleset" the
-    way Debian's default does: the included file replaces its own table with
-    the create/delete/define idiom and leaves everybody else's alone - LXC
-    puts its NAT tables up later in the boot and they have to survive this.
+    After nftables.service, because FuriOS' stock /etc/nftables.conf begins
+    with "flush ruleset" and would take our table with it. PartOf it for the
+    same reason: a package update that restarts nftables flushes everything,
+    and PartOf restarts us right behind it. Without nftables running it does
+    nothing - the unit works whether nftables is enabled or not.
+
+    ExecStop deletes our table only, never the whole ruleset: LXC puts its
+    NAT tables up later in the boot and they have to survive this.
     """
     return "\n".join([
-        "#!/usr/sbin/nft -f",
         "# %s" % MARKER,
-        "#",
-        "# Written by secctl. The file that was here before is kept at",
-        "#   %s" % NFT_BACKUP,
-        "# and put back by:  sudo secctl revert firewall",
+        "# Written by secctl. Undo:  sudo secctl revert firewall",
+        "[Unit]",
+        "Description=furios-security firewall",
+        "Wants=network-pre.target",
+        "Before=network-pre.target shutdown.target",
+        "After=nftables.service",
+        "PartOf=nftables.service",
+        "Conflicts=shutdown.target",
+        "DefaultDependencies=no",
+        "ConditionPathExists=%s" % FIREWALL_FILE,
         "",
-        "include \"%s\"" % FIREWALL_FILE,
+        "[Service]",
+        "Type=oneshot",
+        "RemainAfterExit=yes",
+        "StandardInput=null",
+        "ProtectSystem=full",
+        "ProtectHome=true",
+        "ExecStart=%s -f %s" % (NFT, FIREWALL_FILE),
+        "ExecReload=%s -f %s" % (NFT, FIREWALL_FILE),
+        "ExecStop=-%s delete table inet furios" % NFT,
+        "",
+        "[Install]",
+        "WantedBy=sysinit.target",
         "",
     ])
+
+
+def restore_nft_conf():
+    """Undo what an older secctl did to /etc/nftables.conf.
+
+    Only a file carrying our marker is touched, and it goes back to the copy
+    kept of the original. Whether nftables.service was enabled before us is
+    restored with it - FuriOS ships it enabled, so normally this changes
+    nothing there.
+    """
+    if not ours(NFT_CONF):
+        return
+    original = read_file(NFT_BACKUP)
+    if original is not None:
+        write_file(NFT_CONF, original)
+        os.unlink(NFT_BACKUP)
+    else:
+        os.unlink(NFT_CONF)
+    st = state()
+    if st.get("nftables_was_enabled") is False:
+        run([SYSTEMCTL, "disable", "nftables"])
+    st["nftables_was_enabled"] = None
+    save_state(st)
 
 
 def firewall_live():
@@ -561,8 +610,8 @@ def firewall_live():
     return rc == 0
 
 
-def service_enabled():
-    rc, out = run([SYSTEMCTL, "is-enabled", "nftables"])
+def service_enabled(unit=UNIT_NAME):
+    rc, out = run([SYSTEMCTL, "is-enabled", unit])
     text = out.strip()
     if text in ("enabled", "enabled-runtime"):
         return True
@@ -576,12 +625,12 @@ def firewall_state():
     return {
         "file": os.path.exists(FIREWALL_FILE),
         "ours": ours(FIREWALL_FILE),
-        "conf": ours(NFT_CONF),
+        "conf": ours(UNIT_FILE),
         "service": service_enabled(),
         "live": firewall_live(),
         "lan": cfg["lan"],
         "iface": cfg["iface"],
-        "state": ("on" if ours(FIREWALL_FILE) and ours(NFT_CONF)
+        "state": ("on" if ours(FIREWALL_FILE) and ours(UNIT_FILE)
                   and service_enabled() else "off"),
     }
 
@@ -599,30 +648,22 @@ def firewall_apply():
             say("\nSet it with:      sudo secctl lan 192.168.0.0/24")
         return 1
 
+    if os.path.exists(UNIT_FILE) and not ours(UNIT_FILE):
+        say("%s was not written by us - left alone, firewall not applied."
+            % UNIT_FILE)
+        return 1
+
     write_file(FIREWALL_FILE, firewall_text(cfg))
-
-    # The file that was there before is kept once, and only if somebody else
-    # wrote it. Backing up our own on every apply would overwrite the real
-    # original with a copy of ours the second time around.
-    if os.path.exists(NFT_CONF) and not ours(NFT_CONF) \
-            and not os.path.exists(NFT_BACKUP):
-        os.makedirs(STATE_DIR, exist_ok=True)
-        write_file(NFT_BACKUP, read_file(NFT_CONF) or "")
-    write_file(NFT_CONF, nft_conf_text())
-
-    # Remember whether the service was somebody else's business before we
-    # enabled it, so that revert leaves the phone the way it found it.
-    st = state()
-    if st.get("nftables_was_enabled") is None:
-        st["nftables_was_enabled"] = service_enabled()
-        save_state(st)
+    write_file(UNIT_FILE, unit_text())
+    restore_nft_conf()
 
     rc, out = run([NFT, "-f", FIREWALL_FILE])
     if rc != 0:
         say("nft refused the ruleset - nothing is loaded:")
         say(out.strip())
         return 1
-    rc, out = run([SYSTEMCTL, "enable", "nftables"])
+    run([SYSTEMCTL, "daemon-reload"])
+    rc, out = run([SYSTEMCTL, "enable", UNIT_NAME])
     if rc != 0:
         say("Loaded, but it will not come back after a reboot:")
         say(out.strip())
@@ -631,26 +672,18 @@ def firewall_apply():
 
 
 def firewall_revert():
-    if os.path.exists(FIREWALL_FILE) and not ours(FIREWALL_FILE):
-        say("%s was not written by us - left alone." % FIREWALL_FILE)
-        return 1
+    for path in (FIREWALL_FILE, UNIT_FILE):
+        if os.path.exists(path) and not ours(path):
+            say("%s was not written by us - left alone." % path)
+            return 1
     run([NFT, "delete", "table", "inet", "furios"])
+    if os.path.exists(UNIT_FILE):
+        run([SYSTEMCTL, "disable", UNIT_NAME])
+        os.unlink(UNIT_FILE)
+        run([SYSTEMCTL, "daemon-reload"])
     if os.path.exists(FIREWALL_FILE):
         os.unlink(FIREWALL_FILE)
-
-    if ours(NFT_CONF):
-        original = read_file(NFT_BACKUP)
-        if original is not None:
-            write_file(NFT_CONF, original)
-            os.unlink(NFT_BACKUP)
-        else:
-            os.unlink(NFT_CONF)
-
-    st = state()
-    if st.get("nftables_was_enabled") is False:
-        run([SYSTEMCTL, "disable", "nftables"])
-    st["nftables_was_enabled"] = None
-    save_state(st)
+    restore_nft_conf()
     return 0
 
 

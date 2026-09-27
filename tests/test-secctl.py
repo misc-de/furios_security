@@ -96,7 +96,8 @@ class Paths(Base):
         """The one property the whole suite rests on."""
         for path in (self.s.SYSCTL_FILE, self.s.MODPROBE_FILE,
                      self.s.FIREWALL_FILE, self.s.CONFIG_FILE,
-                     self.s.STATE_FILE, self.s.NFT_CONF, self.s.NFT_BACKUP):
+                     self.s.STATE_FILE, self.s.NFT_CONF, self.s.NFT_BACKUP,
+                     self.s.UNIT_FILE):
             self.assertTrue(path.startswith(self.tmp), path)
 
 
@@ -274,21 +275,52 @@ class FirewallApply(Base):
         self.assertEqual(self.s.firewall_apply(), 1)
         self.assertFalse(os.path.exists(self.s.FIREWALL_FILE))
 
-    def test_the_original_nftables_conf_is_kept(self):
+    def test_nftables_conf_is_not_touched(self):
+        """A conffile of the nftables package. Changing it means a question
+        in the middle of the next nftables update, and answering it with the
+        package's version took the firewall away after the next boot."""
         self.set_lan()
         self.s.write_file(self.s.NFT_CONF, "#!/usr/sbin/nft -f\nflush ruleset\n")
         self.s.firewall_apply()
-        self.assertIn("flush ruleset", self.s.read_file(self.s.NFT_BACKUP))
-        self.assertTrue(self.s.ours(self.s.NFT_CONF))
+        self.assertEqual(self.s.read_file(self.s.NFT_CONF),
+                         "#!/usr/sbin/nft -f\nflush ruleset\n")
+        self.assertFalse(os.path.exists(self.s.NFT_BACKUP))
 
-    def test_a_second_apply_does_not_overwrite_the_backup(self):
-        """The bug this is here for: back up on every apply and the second
-        one saves a copy of OUR file as "the original"."""
+    def test_our_own_unit_is_written_and_enabled(self):
         self.set_lan()
-        self.s.write_file(self.s.NFT_CONF, "the real original\n")
         self.s.firewall_apply()
+        self.assertTrue(self.s.ours(self.s.UNIT_FILE))
+        self.assertIn([self.s.SYSTEMCTL, "enable", self.s.UNIT_NAME], self.calls)
+        self.assertNotIn([self.s.SYSTEMCTL, "enable", "nftables"], self.calls)
+
+    def test_the_unit_comes_after_the_stock_flush(self):
+        """FuriOS' nftables.conf starts with "flush ruleset"; run before it,
+        our table would be gone by the end of the boot."""
+        text = self.s.unit_text()
+        self.assertIn("After=nftables.service", text)
+        self.assertIn("PartOf=nftables.service", text)
+
+    def test_the_unit_never_flushes_the_whole_ruleset(self):
+        """LXC's NAT tables have to survive our stop."""
+        text = self.s.unit_text()
+        self.assertNotIn("flush ruleset", text)
+        self.assertIn("delete table inet furios", text)
+
+    def test_an_older_rewrite_of_nftables_conf_is_put_back(self):
+        """What earlier versions did: our include in nftables.conf, the
+        original kept aside. Applying now restores it."""
+        self.set_lan()
+        self.s.write_file(self.s.NFT_BACKUP, "the real original\n")
+        self.s.write_file(self.s.NFT_CONF, "# %s\ninclude x\n" % self.s.MARKER)
         self.s.firewall_apply()
-        self.assertEqual(self.s.read_file(self.s.NFT_BACKUP), "the real original\n")
+        self.assertEqual(self.s.read_file(self.s.NFT_CONF), "the real original\n")
+        self.assertFalse(os.path.exists(self.s.NFT_BACKUP))
+
+    def test_a_foreign_unit_file_is_refused(self):
+        self.set_lan()
+        self.s.write_file(self.s.UNIT_FILE, "[Unit]\nsomebody else's\n")
+        self.assertEqual(self.s.firewall_apply(), 1)
+        self.assertEqual(self.s.read_file(self.s.UNIT_FILE), "[Unit]\nsomebody else's\n")
 
     def test_nft_is_asked_to_load_the_file(self):
         self.set_lan()
@@ -304,13 +336,13 @@ class FirewallApply(Base):
 
 
 class FirewallRevert(Base):
-    def test_the_original_comes_back(self):
+    def test_our_unit_and_ruleset_go(self):
         self.set_lan()
-        self.s.write_file(self.s.NFT_CONF, "the real original\n")
         self.s.firewall_apply()
         self.s.firewall_revert()
-        self.assertEqual(self.s.read_file(self.s.NFT_CONF), "the real original\n")
         self.assertFalse(os.path.exists(self.s.FIREWALL_FILE))
+        self.assertFalse(os.path.exists(self.s.UNIT_FILE))
+        self.assertIn([self.s.SYSTEMCTL, "disable", self.s.UNIT_NAME], self.calls)
 
     def test_the_live_table_is_deleted(self):
         self.set_lan()
@@ -320,23 +352,21 @@ class FirewallRevert(Base):
         self.assertIn([self.s.NFT, "delete", "table", "inet", "furios"],
                       self.calls)
 
-    def test_a_service_we_enabled_is_disabled_again(self):
+    def test_nftables_service_is_left_alone(self):
+        """It is the package's, enabled or not."""
         self.set_lan()
-        self.answers[(self.s.SYSTEMCTL, "is-enabled")] = (1, "disabled\n")
         self.s.firewall_apply()
-        self.calls.clear()
         self.s.firewall_revert()
-        self.assertIn([self.s.SYSTEMCTL, "disable", "nftables"], self.calls)
+        for call in self.calls:
+            self.assertNotEqual(call[-1:], ["nftables"], call)
 
-    def test_a_service_that_was_already_enabled_is_left_on(self):
-        """It was somebody else's before us. Revert puts the phone back the
-        way it was found, which here means not touching it."""
-        self.set_lan()
-        self.answers[(self.s.SYSTEMCTL, "is-enabled")] = (0, "enabled\n")
-        self.s.firewall_apply()
-        self.calls.clear()
+    def test_an_older_rewrite_is_undone_on_revert_too(self):
+        self.s.write_file(self.s.NFT_BACKUP, "the real original\n")
+        self.s.write_file(self.s.NFT_CONF, "# %s\ninclude x\n" % self.s.MARKER)
+        self.s.write_file(self.s.STATE_FILE, json.dumps({"nftables_was_enabled": False}))
         self.s.firewall_revert()
-        self.assertNotIn([self.s.SYSTEMCTL, "disable", "nftables"], self.calls)
+        self.assertEqual(self.s.read_file(self.s.NFT_CONF), "the real original\n")
+        self.assertIn([self.s.SYSTEMCTL, "disable", "nftables"], self.calls)
 
 
 class Cidr(Base):

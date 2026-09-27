@@ -82,9 +82,12 @@ Reading needs no root. Changing does.
 sudo secctl revert all     # or ./uninstall.sh, which does this first
 ```
 
-The original `/etc/nftables.conf` is kept at
-`/etc/furios-security/nftables.conf.orig` and put back; `nftables.service` is
-disabled again only if this project enabled it.
+The firewall comes up from its own unit, `furios-firewall.service`, which
+revert disables and removes. `/etc/nftables.conf` and `nftables.service` are
+never touched: the file is a conffile of the nftables package, and changing
+it meant a question in the middle of the next nftables update. Versions before
+27.9.2026 did rewrite it; applying or reverting now puts the original back
+from `/etc/furios-security/nftables.conf.orig`.
 
 One value cannot be taken back on a running kernel:
 `kernel.unprivileged_bpf_disabled` is one-way on 4.19 by design, so that an

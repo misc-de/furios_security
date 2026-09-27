@@ -23,8 +23,8 @@ fi
 sudo rm -f "$BIN/secctl" "$POLKIT/de.misc-de.secctl.policy"
 sudo rm -rf "$DOC"
 # The state directory last, and only when it is empty of anything we did not
-# put there: it holds the copy of whatever /etc/nftables.conf was before us,
-# and revert above is what puts that back.
+# put there. An older secctl kept its copy of /etc/nftables.conf in it, and
+# revert above is what puts that back.
 sudo rmdir /etc/furios-security 2>/dev/null || true
 
 echo "Removed."
