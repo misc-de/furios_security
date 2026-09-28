@@ -36,4 +36,4 @@ sudo rmdir /etc/furios-security 2>/dev/null || true
 
 echo "Removed."
 echo "Note: kernel.unprivileged_bpf_disabled cannot be cleared on a running"
-echo "4.19 kernel - it goes back to 0 at the next boot."
+echo "kernel - it goes back to 0 at the next boot."

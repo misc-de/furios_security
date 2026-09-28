@@ -1,24 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 misc-de
 # SPDX-License-Identifier: MIT
-"""Three locks for a kernel that stopped getting security fixes.
+"""Hardening for the FuriPhone: fewer routes into the kernel.
 
-This phone runs 4.19.325, and that is not merely old: it is the LAST release
-of the 4.19 series. Upstream declared it end of life in December 2024 and has
-published nothing for it since. FuriLabs carries the tree on, but the package
-changelog of 4.19.325+furios8 holds no CVE reference and no stable merge -
-what arrives there are feature backports (openat2, close_range, the new mount
-API) so that a current Debian userland runs at all, plus MediaTek and clang
-fixes.
-
-A newer kernel is not on offer and cannot casually be built: binder,
-hwcomposer, the audio HAL and the modem driver are all compiled against this
-BSP. CIP maintains a 4.19.325-cip series with security backports until 2029,
-which is the one real way out, but it is a rebase of somebody's Android fork
-and not something a phone does to itself.
-
-So the holes stay. What can be taken away is the ROUTE to them, and that is
-the whole of what this program does:
+None of this replaces kernel updates. It is defence in depth, and this is the
+whole of what this program does:
 
   sysctl    unprivileged BPF off, kernel pointers and dmesg closed, ptrace
             limited to one's own children
@@ -33,7 +19,7 @@ the whole of what this program does:
             guessed through in an afternoon
 
 Not one of those fixes a vulnerability. They make the cheap paths to one
-expensive, which for an EOL kernel is the honest goal. What is left after all
+expensive. What is left after all
 three - the Bluetooth stack in radio range, and whatever a compromised
 browser can reach locally - is written down in FINDINGS.md rather than
 papered over here.
@@ -124,7 +110,7 @@ LOCKOUT_SCHEDULE = (5, 10, 15, 30, 60, 120, 240, 480)
 # is whether it may go.
 SYSCTLS = [
     ("kernel.unprivileged_bpf_disabled", "1",
-     "unprivileged BPF is a classic local privilege escalation path on 4.19"),
+     "unprivileged BPF is a classic local privilege escalation path"),
     ("net.core.bpf_jit_harden", "2",
      "makes JIT spraying harder for the BPF that is still allowed"),
     ("kernel.dmesg_restrict", "1",
@@ -147,7 +133,7 @@ MODULE_GROUPS = [
     ("protocol families", [
         "rds", "tipc", "x25", "atm", "can", "appletalk",
     ], "any process could load these with a single socket() call, and they "
-       "are among the most productive sources of 4.19 local exploits"),
+       "are among the most productive sources of local exploits"),
     ("line disciplines and legacy devices", [
         "n_hdlc", "ppdev",
     ], "reachable from a terminal, maintained by nobody"),
@@ -313,9 +299,8 @@ def sysctl_text():
              "# SPDX-FileCopyrightText: Copyright (c) 2026 misc-de",
              "# SPDX-License-Identifier: MIT",
              "#",
-             "# Kernel 4.19 has been end of life since December 2024. These",
-             "# close the cheap routes to a local privilege escalation; they",
-             "# do not fix one.",
+             "# These close the cheap routes to a local privilege",
+             "# escalation; they do not fix one.",
              "#",
              "# Undo:  sudo secctl revert sysctl",
              ""]
@@ -380,8 +365,8 @@ def sysctl_apply():
 def sysctl_revert():
     """The file goes, and the values go back to what the kernel boots with.
 
-    Not every one of them can: kernel.unprivileged_bpf_disabled is one-way on
-    4.19 - once set it cannot be cleared without a reboot, by design, so that
+    Not every one of them can: kernel.unprivileged_bpf_disabled is one-way -
+    once set it cannot be cleared without a reboot, by design, so that
     an exploit cannot undo it either. That is said plainly rather than
     reported as a failure.
     """
@@ -993,7 +978,7 @@ def do(which, table, verb):
     return 0
 
 
-USAGE = """secctl - hardening for an end-of-life kernel
+USAGE = """secctl - kernel hardening for the FuriPhone
 
   secctl status [--json]        what is on, what is off, what listens
   secctl apply [part|all]       turn it on

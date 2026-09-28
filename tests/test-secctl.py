@@ -160,7 +160,7 @@ class SysctlRevert(Base):
         self.assertFalse(os.path.exists(self.s.SYSCTL_FILE))
 
     def test_bpf_is_not_written_back_to_zero(self):
-        """It cannot be cleared on 4.19 and trying looks like a failure in
+        """It cannot be cleared at runtime and trying looks like a failure in
         the output. The code has to skip it rather than try and report."""
         self.s.sysctl_apply()
         self.proc_sysctl("kernel.unprivileged_bpf_disabled", "1")

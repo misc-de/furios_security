@@ -1,23 +1,10 @@
 # furios_security
 
-Hardening for a phone whose kernel has stopped receiving security fixes.
+Hardening for the FuriPhone FLX1s: fewer routes into the kernel, whatever
+kernel it boots.
 
-The FuriPhone FLX1s runs **4.19.325**. That is not just an old kernel, it is
-the *last* release of the 4.19 series: upstream declared it end of life in
-December 2024 and has published nothing for it since. The package changelog
-of `4.19.325+furios8` contains no CVE reference and no stable merge — the
-~1000 commits in it are feature backports (`openat2`, `close_range`, the new
-mount API) so that a current Debian userland runs at all, plus MediaTek and
-clang fixes.
-
-A newer kernel is not on offer. Binder, hwcomposer, the audio HAL and the
-modem driver are all compiled against this BSP, so moving to 5.x or 6.x means
-new vendor blobs or mainline drivers, and for this SoC neither exists. CIP
-maintains a `4.19.325-cip` series with security backports until 2029, which is
-the one real way out, but it is a rebase of an Android fork and not something
-a phone does to itself.
-
-So the holes stay. What this project takes away is the **route** to them.
+None of this replaces kernel updates. It is defence in depth - it takes away
+the cheap routes an attacker would use first.
 
 ## The four parts
 
@@ -31,7 +18,7 @@ Each switches on its own, each goes away again cleanly.
 | `lockout` | the phosh lock screen locks itself after 3 wrong PINs: 5 min, then 10, 15, 30, 60, 120, 240 and 480 from then on; a correct PIN starts over |
 
 Not one of them fixes a vulnerability. They make the cheap paths to one
-expensive, which for an EOL kernel is the honest goal.
+expensive.
 
 ### Why `install`, not `blacklist`
 
@@ -110,7 +97,7 @@ it meant a question in the middle of the next nftables update. Versions before
 from `/etc/furios-security/nftables.conf.orig`.
 
 One value cannot be taken back on a running kernel:
-`kernel.unprivileged_bpf_disabled` is one-way on 4.19 by design, so that an
+`kernel.unprivileged_bpf_disabled` is one-way by design, so that an
 exploit cannot clear it either. It returns to 0 at the next boot.
 
 ## What this does not reach
@@ -118,7 +105,7 @@ exploit cannot clear it either. It returns to 0 at the next boot.
 Written up in [FINDINGS.md](FINDINGS.md), because a security tool that only
 lists its wins is misleading. The short version: the in-kernel Bluetooth stack
 is in radio range of anybody, and a compromised browser still runs local code
-against an unpatched kernel.
+on the phone.
 
 ## Tests
 
