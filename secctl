@@ -502,9 +502,11 @@ def pam_profile_text():
         "Priority: 1024\n"
         "Auth-Type: Primary\n"
         "Auth:\n"
-        "\trequisite\t%(m)s preauth\n"
+        # quiet: phosh shows no PAM messages and logs "conversation failed"
+        # for each one it is sent.
+        "\trequisite\t%(m)s preauth quiet\n"
         "Auth-Initial:\n"
-        "\trequisite\t%(m)s preauth\n"
+        "\trequisite\t%(m)s preauth quiet\n"
         "Account-Type: Additional\n"
         "Account:\n"
         "\toptional\t%(m)s\n"

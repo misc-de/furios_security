@@ -242,6 +242,13 @@ class Lockout(unittest.TestCase):
         self.assertEqual(0o600, os.stat(self.statefile()).st_mode & 0o777)
         self.assertEqual(0o700, os.stat(os.path.dirname(self.statefile())).st_mode & 0o777)
 
+    def test_quiet_sends_no_message_but_still_refuses(self):
+        self.stack("phosh", "quiet")
+        self.fail(3)
+        r, errors = login(self.conf, "right")
+        self.assertEqual(PAM_AUTH_ERR, r)
+        self.assertEqual([], errors)
+
     def test_a_schedule_and_deny_from_the_arguments(self):
         self.stack("phosh", "deny=2 schedule=1,2")
         self.fail(2)

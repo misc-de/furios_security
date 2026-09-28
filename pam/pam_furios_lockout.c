@@ -29,6 +29,8 @@
 //   schedule=a,b,...   lock lengths in minutes (default 5,10,15,30,60,120,240,480)
 //   interval=S         failures further apart than this are forgotten (900)
 //   services=a,b       which PAM services it acts for (default phosh)
+//   quiet              no message to the front end - phosh cannot show one
+//                      and logs "conversation failed" for every attempt
 //   dir=PATH           keep state in PATH/<user> instead of the home - for
 //                      the tests, which must not touch the real state
 
@@ -51,6 +53,7 @@
 
 struct opts {
 	int preauth;
+	int quiet;
 	int deny;
 	long interval;
 	int nsteps;
@@ -72,6 +75,7 @@ static void parse(int argc, const char **argv, struct opts *o)
 	static const long dflt[] = { 5, 10, 15, 30, 60, 120, 240, 480 };
 
 	o->preauth = 0;
+	o->quiet = 0;
 	o->deny = 3;
 	o->interval = 900;
 	o->services = "phosh";
@@ -84,6 +88,8 @@ static void parse(int argc, const char **argv, struct opts *o)
 		const char *a = argv[i];
 		if (strcmp(a, "preauth") == 0) {
 			o->preauth = 1;
+		} else if (strcmp(a, "quiet") == 0) {
+			o->quiet = 1;
 		} else if (strncmp(a, "deny=", 5) == 0) {
 			int n = atoi(a + 5);
 			if (n > 0)
@@ -243,11 +249,12 @@ static int save(const char *dir, const char *file, const struct state *s)
 	return 0;
 }
 
-static int refuse(pam_handle_t *pamh, long left)
+static int refuse(pam_handle_t *pamh, const struct opts *o, long left)
 {
-	/* phosh does not show conversation messages today; other front ends
-	 * do, and the journal always has it. */
-	pam_error(pamh, "Too many failed attempts. Try again in %ld:%02ld.",
+	/* phosh does not show conversation messages today (hence "quiet" in
+	 * the profile); other front ends do. */
+	if (!o->quiet)
+		pam_error(pamh, "Too many failed attempts. Try again in %ld:%02ld.",
 		  left / 60, left % 60);
 	return PAM_AUTH_ERR;
 }
@@ -282,7 +289,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 			s.lock_start = now;
 		if (now < s.lock_start + s.lock_len) {
 			save(dir, file, &s);
-			return refuse(pamh, s.lock_start + s.lock_len - now);
+			return refuse(pamh, &o, s.lock_start + s.lock_len - now);
 		}
 		s.lock_len = 0;
 	}
@@ -304,7 +311,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 		if (save(dir, file, &s) != 0)
 			return PAM_IGNORE;
 		if (now < s.lock_start + s.lock_len)
-			return refuse(pamh, s.lock_start + s.lock_len - now);
+			return refuse(pamh, &o, s.lock_start + s.lock_len - now);
 		s.lock_len = 0;
 	}
 
