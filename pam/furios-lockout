@@ -1,0 +1,13 @@
+Name: furios: lock screen lockout after failed attempts (phosh only)
+Default: no
+Priority: 1024
+Auth-Type: Primary
+Auth:
+	requisite	pam_furios_lockout.so preauth
+Auth-Initial:
+	requisite	pam_furios_lockout.so preauth
+Account-Type: Additional
+Account:
+	optional	pam_furios_lockout.so
+Account-Initial:
+	optional	pam_furios_lockout.so

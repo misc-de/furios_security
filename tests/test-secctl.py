@@ -24,6 +24,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -495,6 +496,151 @@ class Cli(Base):
         for part in self.s.PARTS:
             self.assertIn("state", data["parts"][part])
 
+
+
+class Lockout(Base):
+    """The lock-screen part. The module's own behaviour is test-pam.py; this
+    is secctl putting it into the login stack and taking it out again."""
+
+    def module_dir(self):
+        d = os.path.join(self.tmp, "usr/lib/test-multiarch/security")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def real_module(self):
+        path = os.path.join(self.module_dir(), self.s.PAM_MODULE_NAME)
+        subprocess.run(["gcc", "-shared", "-fPIC", "-o", path,
+                        os.path.join(ROOT, "pam", "pam_furios_lockout.c"),
+                        "-lpam"], check=True)
+        return path
+
+    def stub_pam_auth_update(self):
+        """Does what pam-auth-update does to the two files, as far as the
+        question "is the module named" goes."""
+        def answer(argv, stdin=None):
+            self.calls.append(list(argv))
+            if argv[:1] != [self.s.PAM_AUTH_UPDATE]:
+                return (0, "")
+            for f in (self.s.COMMON_AUTH, self.s.COMMON_ACCOUNT):
+                os.makedirs(os.path.dirname(f), exist_ok=True)
+                with open(f, "w") as fh:
+                    if "--enable" in argv:
+                        fh.write("auth requisite pam_furios_lockout.so preauth\n")
+                    else:
+                        fh.write("auth [success=1 default=ignore] pam_unix.so\n")
+            return (0, "")
+        self.s.run = answer
+
+    def test_paths_are_under_the_test_root(self):
+        for path in (self.s.PAM_PROFILE, self.s.COMMON_AUTH, self.s.COMMON_ACCOUNT):
+            self.assertTrue(path.startswith(self.tmp), path)
+
+    def test_off_after_installation(self):
+        self.assertEqual("off", self.s.lockout_state()["state"])
+
+    def test_without_the_module_it_refuses(self):
+        """A stack naming a module that is not there fails every login."""
+        self.stub_pam_auth_update()
+        self.assertEqual(1, self.s.lockout_apply())
+        self.assertFalse(os.path.exists(self.s.PAM_PROFILE))
+        self.assertEqual([], [c for c in self.calls
+                              if c[:1] == [self.s.PAM_AUTH_UPDATE]])
+
+    def test_a_module_that_does_not_load_is_refused(self):
+        with open(os.path.join(self.module_dir(), self.s.PAM_MODULE_NAME), "w") as fh:
+            fh.write("not an ELF file")
+        self.stub_pam_auth_update()
+        self.assertEqual(1, self.s.lockout_apply())
+        self.assertFalse(self.s.lockout_in_stack())
+
+    def test_on_and_off(self):
+        self.real_module()
+        self.stub_pam_auth_update()
+        self.assertEqual(0, self.s.lockout_apply())
+        self.assertEqual("on", self.s.lockout_state()["state"])
+        self.assertTrue(self.s.pam_profile_ours())
+        self.assertIn(["--root", self.tmp], [c[-2:] for c in self.calls])
+        self.assertEqual(0, self.s.lockout_revert())
+        self.assertEqual("off", self.s.lockout_state()["state"])
+        self.assertFalse(os.path.exists(self.s.PAM_PROFILE))
+
+    def test_a_refusing_pam_auth_update_is_reported(self):
+        self.real_module()
+        self.answers[(self.s.PAM_AUTH_UPDATE,)] = (
+            0, "pam-auth-update: Local modifications to /etc/pam.d/common-*, not updating.")
+        self.assertEqual(1, self.s.lockout_apply())
+        self.assertTrue(any("did not take it" in line for line in self.said))
+
+    def test_a_foreign_profile_is_left_alone(self):
+        self.real_module()
+        self.s.write_file(self.s.PAM_PROFILE, "Name: somebody else\n")
+        self.stub_pam_auth_update()
+        self.assertEqual(1, self.s.lockout_apply())
+        self.assertEqual(1, self.s.lockout_revert())
+        self.assertEqual("Name: somebody else\n", self.s.read_file(self.s.PAM_PROFILE))
+
+    def test_revert_needs_nothing_to_be_there(self):
+        self.stub_pam_auth_update()
+        self.assertEqual(0, self.s.lockout_revert())
+
+    def test_the_profile_as_the_real_pam_auth_update_reads_it(self):
+        """Not a stub: the system's pam-auth-update, pointed at a copy of
+        this phone's PAM configuration. The module has to land before
+        pam_unix in common-auth, and after it in common-account."""
+        tool = "/usr/sbin/pam-auth-update"
+        if not os.path.exists("/etc/pam.d/common-auth") or not os.access(tool, os.X_OK):
+            self.skipTest("no pam-auth-update here")
+        for sub in ("etc/pam.d", "var/lib/pam", "usr/share/pam-configs"):
+            os.makedirs(os.path.join(self.tmp, sub), exist_ok=True)
+        for name in os.listdir("/usr/share/pam-configs"):
+            if name != self.s.PAM_PROFILE_NAME:
+                shutil.copy(os.path.join("/usr/share/pam-configs", name),
+                            os.path.join(self.tmp, "usr/share/pam-configs"))
+        for name in ("common-auth", "common-account", "common-session",
+                     "common-session-noninteractive", "common-password"):
+            shutil.copy(os.path.join("/etc/pam.d", name),
+                        os.path.join(self.tmp, "etc/pam.d"))
+        for name in os.listdir("/var/lib/pam"):
+            shutil.copy(os.path.join("/var/lib/pam", name),
+                        os.path.join(self.tmp, "var/lib/pam"))
+        self.real_module()
+        # debconf wants to write its database under /var/cache, which this
+        # suite may not. A database of its own in the test root instead.
+        rc = os.path.join(self.tmp, "debconf.conf")
+        with open(rc, "w") as fh:
+            fh.write("Config: configdb\nTemplates: templatedb\n\n"
+                     "Name: configdb\nDriver: File\nFilename: %s/config.dat\n\n"
+                     "Name: templatedb\nDriver: File\nMode: 644\n"
+                     "Filename: %s/templates.dat\n" % (self.tmp, self.tmp))
+        env = dict(os.environ, DEBCONF_SYSTEMRC=rc)
+
+        def real(argv, stdin=None):
+            p = subprocess.run(argv, capture_output=True, text=True, env=env)
+            return p.returncode, p.stdout + p.stderr
+        self.s.run = real
+        self.assertEqual(0, self.s.lockout_apply(), self.said)
+        auth = [l.split() for l in open(self.s.COMMON_AUTH)
+                if l.strip() and not l.startswith("#")]
+        mods = [l[-1] if l[-1] != "preauth" else l[-2] for l in auth]
+        self.assertLess(mods.index(self.s.PAM_MODULE_NAME),
+                        [i for i, l in enumerate(auth) if "pam_unix.so" in l][0])
+        self.assertEqual(["requisite", self.s.PAM_MODULE_NAME, "preauth"],
+                         auth[mods.index(self.s.PAM_MODULE_NAME)][1:])
+        account = open(self.s.COMMON_ACCOUNT).read()
+        self.assertIn("optional\t" + self.s.PAM_MODULE_NAME, account)
+        self.assertEqual(0, self.s.lockout_revert())
+        self.assertNotIn(self.s.PAM_MODULE_NAME, open(self.s.COMMON_AUTH).read())
+        self.assertNotIn(self.s.PAM_MODULE_NAME, open(self.s.COMMON_ACCOUNT).read())
+
+    def test_unlock_clears_the_callers_state(self):
+        home = os.path.join(self.tmp, "home")
+        path = os.path.join(home, ".local/state/furios-lockout/state")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as fh:
+            fh.write("0 2 %d 600 0\n" % int(__import__("time").time()))
+        self.s.lockout_user_state = lambda: {"path": path}
+        self.assertEqual(0, self.s.main(["secctl", "unlock"]))
+        self.assertFalse(os.path.exists(path))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

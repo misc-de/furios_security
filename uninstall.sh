@@ -21,6 +21,13 @@ if [ -x "$BIN/secctl" ]; then
 fi
 
 sudo rm -f "$BIN/secctl" "$POLKIT/de.misc-de.secctl.policy"
+# Only now: revert above took it out of the login stack, and a stack that
+# names a missing module fails every login, sudo included.
+if ! grep -qs pam_furios_lockout /etc/pam.d/common-auth /etc/pam.d/common-account; then
+    sudo rm -f /usr/lib/*/security/pam_furios_lockout.so
+else
+    echo "pam_furios_lockout is still in /etc/pam.d/common-* - module left in place." >&2
+fi
 sudo rm -rf "$DOC"
 # The state directory last, and only when it is empty of anything we did not
 # put there. An older secctl kept its copy of /etc/nftables.conf in it, and

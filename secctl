@@ -28,6 +28,10 @@ the whole of what this program does:
   firewall  one input chain defaulting to drop, so what listens on this phone
             is reachable from the local network and not from the carrier's
 
+  lockout   the phosh lock screen locks itself after 3 wrong PINs - 5
+            minutes, then 10, 15, 30, 60 and longer - so a PIN cannot be
+            guessed through in an afternoon
+
 Not one of those fixes a vulnerability. They make the cheap paths to one
 expensive, which for an EOL kernel is the honest goal. What is left after all
 three - the Bluetooth stack in radio range, and whatever a compromised
@@ -41,6 +45,8 @@ Root is needed to change anything: this writes /etc and talks to nftables.
 Reading the state needs none.
 """
 
+import ctypes
+import glob
 import ipaddress
 import json
 import os
@@ -94,7 +100,22 @@ IP = os.environ.get("FURIOS_SECURITY_IP", "/usr/bin/ip")
 # reported, never removed.
 MARKER = "furios-security: managed file"
 
-PARTS = ("sysctl", "modules", "firewall")
+PARTS = ("sysctl", "modules", "firewall", "lockout")
+
+# The lock-screen lockout: our PAM module, and the pam-auth-update profile
+# that puts it into common-auth/common-account. Through pam-auth-update and
+# not by editing /etc/pam.d/phosh: that file belongs to furios-quirks-keyring,
+# and a changed conffile is a question in the middle of the next update. The
+# module itself only acts for the service "phosh"; sudo, ssh and polkit pass
+# through it untouched.
+PAM_PROFILE_NAME = "furios-lockout"
+PAM_PROFILE = _p("usr/share/pam-configs", PAM_PROFILE_NAME)
+PAM_MODULE_NAME = "pam_furios_lockout.so"
+COMMON_AUTH = _p("etc/pam.d/common-auth")
+COMMON_ACCOUNT = _p("etc/pam.d/common-account")
+PAM_AUTH_UPDATE = os.environ.get("FURIOS_SECURITY_PAM_AUTH_UPDATE",
+                                 "/usr/sbin/pam-auth-update")
+LOCKOUT_SCHEDULE = (5, 10, 15, 30, 60, 120, 240, 480)
 
 # ---------------------------------------------------------------- what we set
 #
@@ -468,6 +489,152 @@ def modules_revert():
     return 0
 
 
+# ---------------------------------------------------------------- lockout part
+
+
+def pam_profile_text():
+    """pam-auth-update's format has no comments, so the Name line is how the
+    file is recognised as ours."""
+    return (
+        "Name: furios lock screen lockout (phosh only, secctl)\n"
+        "Default: no\n"
+        # Above pam_unix (256), so the check runs before the PIN is.
+        "Priority: 1024\n"
+        "Auth-Type: Primary\n"
+        "Auth:\n"
+        "\trequisite\t%(m)s preauth\n"
+        "Auth-Initial:\n"
+        "\trequisite\t%(m)s preauth\n"
+        "Account-Type: Additional\n"
+        "Account:\n"
+        "\toptional\t%(m)s\n"
+        "Account-Initial:\n"
+        "\toptional\t%(m)s\n" % {"m": PAM_MODULE_NAME})
+
+
+def pam_profile_ours():
+    text = read_file(PAM_PROFILE)
+    return text is not None and "secctl)" in text and PAM_MODULE_NAME in text
+
+
+def pam_module():
+    """Where the built module lies, or None. PAM looks in the multiarch
+    directory first; install.sh puts it there."""
+    for pattern in ("usr/lib/*/security", "lib/*/security", "usr/lib/security"):
+        for d in sorted(glob.glob(_p(pattern))):
+            path = os.path.join(d, PAM_MODULE_NAME)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def pam_module_loads(path):
+    """A module PAM cannot load, named in common-auth, fails EVERY login -
+    sudo included. So it is loaded here first, and the entry points looked
+    for, before the stack is allowed to name it."""
+    try:
+        lib = ctypes.CDLL(path)
+        return all(hasattr(lib, sym) for sym in
+                   ("pam_sm_authenticate", "pam_sm_acct_mgmt", "pam_sm_setcred"))
+    except OSError:
+        return False
+
+
+def lockout_in_stack():
+    return any(PAM_MODULE_NAME in (read_file(f) or "")
+               for f in (COMMON_AUTH, COMMON_ACCOUNT))
+
+
+def lockout_user_state():
+    """The lock as the owner of the session sees it: who ran pkexec, who ran
+    sudo, or whoever is asking."""
+    import pwd
+    uid = os.environ.get("PKEXEC_UID")
+    try:
+        if uid is not None:
+            home = pwd.getpwuid(int(uid)).pw_dir
+        elif os.environ.get("SUDO_USER"):
+            home = pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir
+        else:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, ValueError):
+        return None
+    path = os.path.join(home, ".local/state/furios-lockout/state")
+    text = read_file(path)
+    if text is None:
+        return {"path": path, "failures": 0, "locks": 0, "locked_for": 0}
+    try:
+        pending, strikes, start, length, _last = (int(x) for x in text.split())
+    except ValueError:
+        return None
+    import time
+    left = max(0, start + length - int(time.time())) if length else 0
+    return {"path": path, "failures": pending, "locks": strikes,
+            "locked_for": left}
+
+
+def pam_auth_update(*args):
+    argv = [PAM_AUTH_UPDATE] + list(args)
+    if ROOT not in ("/", ""):
+        argv += ["--root", ROOT]
+    # Never a dialog: this runs from pkexec with no terminal behind it.
+    os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+    return run(argv)
+
+
+def lockout_state():
+    module = pam_module()
+    in_stack = lockout_in_stack()
+    return {
+        "module": module is not None,
+        "profile": pam_profile_ours(),
+        "enabled": in_stack,
+        "schedule": list(LOCKOUT_SCHEDULE),
+        "user": lockout_user_state(),
+        "state": ("on" if in_stack and module else
+                  "off" if not in_stack else "partial"),
+    }
+
+
+def lockout_apply():
+    module = pam_module()
+    if module is None:
+        say("%s is not installed - run install.sh first." % PAM_MODULE_NAME)
+        return 1
+    if not pam_module_loads(module):
+        say("%s does not load - not putting it into the login stack." % module)
+        return 1
+    if os.path.exists(PAM_PROFILE) and not pam_profile_ours():
+        say("%s was not written by us - left alone." % PAM_PROFILE)
+        return 1
+    write_file(PAM_PROFILE, pam_profile_text())
+    rc, out = pam_auth_update("--enable", PAM_PROFILE_NAME)
+    if rc != 0 or not lockout_in_stack():
+        # "Local modifications to /etc/pam.d/common-*, not updating" is the
+        # usual one: pam-auth-update will not overwrite a hand-edited file.
+        say("pam-auth-update did not take it: %s" % out.strip())
+        return 1
+    return 0
+
+
+def lockout_revert():
+    if os.path.exists(PAM_PROFILE) and not pam_profile_ours():
+        say("%s was not written by us - left alone." % PAM_PROFILE)
+        return 1
+    if os.path.exists(PAM_PROFILE) or lockout_in_stack():
+        rc, out = pam_auth_update("--remove", PAM_PROFILE_NAME)
+        if rc != 0:
+            say("pam-auth-update --remove failed: %s" % out.strip())
+            return 1
+    if os.path.exists(PAM_PROFILE):
+        os.unlink(PAM_PROFILE)
+    if lockout_in_stack():
+        say("%s is still named in /etc/pam.d/common-* - edited by hand?"
+            % PAM_MODULE_NAME)
+        return 1
+    return 0
+
+
 # ---------------------------------------------------------------- firewall part
 
 
@@ -690,11 +857,11 @@ def firewall_revert():
 # ---------------------------------------------------------------- the whole
 
 APPLY = {"sysctl": sysctl_apply, "modules": modules_apply,
-         "firewall": firewall_apply}
+         "firewall": firewall_apply, "lockout": lockout_apply}
 REVERT = {"sysctl": sysctl_revert, "modules": modules_revert,
-          "firewall": firewall_revert}
+          "firewall": firewall_revert, "lockout": lockout_revert}
 STATE = {"sysctl": sysctl_state, "modules": modules_state,
-         "firewall": firewall_state}
+         "firewall": firewall_state, "lockout": lockout_state}
 
 
 def exposure():
@@ -769,6 +936,19 @@ def status(as_json=False):
                                   "not readable without root"))
     say("  home network    %s" % (fw["lan"] or "not set - see: secctl lan"))
 
+    lo = parts["lockout"]
+    say("")
+    say("lockout  %s  (lock screen: 3 wrong PINs lock it for %s min)"
+        % (lo["state"], ", ".join(str(m) for m in lo["schedule"])))
+    if not lo["module"]:
+        say("  module          not installed - run install.sh")
+    user = lo["user"]
+    if user and user["locked_for"]:
+        say("  locked now      %d:%02d left" % divmod(user["locked_for"], 60))
+    elif user and (user["failures"] or user["locks"]):
+        say("  since unlocking %d failed, %d lock(s)"
+            % (user["failures"], user["locks"]))
+
     exp = data["exposure"]
     say("")
     if not exp["readable"]:
@@ -821,7 +1001,9 @@ USAGE = """secctl - hardening for an end-of-life kernel
   secctl lan <cidr>             the network SSH may be reached from,
                                 e.g. 192.168.0.0/24 - "auto" to take the
                                 current one
-  secctl parts                  the three parts, one per line
+  secctl unlock                 end a lock-screen lock now (as yourself,
+                                no root - e.g. over SSH)
+  secctl parts                  the parts, one per line
 
 parts: %s
 
@@ -838,6 +1020,13 @@ def main(argv):
 
     if cmd == "status":
         return status(as_json="--json" in args)
+
+    if cmd == "unlock":
+        user = lockout_user_state()
+        if user and os.path.exists(user["path"]):
+            os.unlink(user["path"])
+        say("lock screen unlocked - no lock, no failures counted")
+        return 0
 
     if cmd == "parts":
         for name in PARTS:

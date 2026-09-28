@@ -19,7 +19,7 @@ a phone does to itself.
 
 So the holes stay. What this project takes away is the **route** to them.
 
-## The three parts
+## The four parts
 
 Each switches on its own, each goes away again cleanly.
 
@@ -28,6 +28,7 @@ Each switches on its own, each goes away again cleanly.
 | `sysctl` | unprivileged BPF off, JIT hardened, `dmesg` and kernel pointers closed, `ptrace` limited to one's own children |
 | `modules` | the kernel stops auto-loading 14 protocol families, line disciplines and filesystems that nothing here uses |
 | `firewall` | one nftables input chain with a default of **drop** — what listens on this phone is reachable from the home network, not from the carrier's |
+| `lockout` | the phosh lock screen locks itself after 3 wrong PINs: 5 min, then 10, 15, 30, 60, 120, 240 and 480 from then on; a correct PIN starts over |
 
 Not one of them fixes a vulnerability. They make the cheap paths to one
 expensive, which for an EOL kernel is the honest goal.
@@ -38,6 +39,25 @@ expensive, which for an EOL kernel is the honest goal.
 through `socket(AF_TIPC, …)` and a filesystem through `mount()` regardless —
 any process on the phone could pull in a driver nobody has audited in years.
 `install <module> /bin/true` is what actually stops it.
+
+### How the lockout works, and what it cannot do
+
+`pam_furios_lockout.so` (in `pam/`, built by `install.sh`) goes into
+`common-auth` and `common-account` through `pam-auth-update`, not into
+`/etc/pam.d/phosh`, which belongs to another package. It acts only for the
+service `phosh`; sudo, SSH and polkit pass through untouched. Every attempt is
+counted before the PIN is checked and cleared once the account stack runs,
+which phosh reaches only after a correct PIN.
+
+It fails open: an unreadable state, another user, anything it does not
+understand, and it steps aside. `secctl apply lockout` loads the module first
+and refuses if it does not, because a login stack naming a module PAM cannot
+load fails every login, sudo included.
+
+phosh does not show PAM messages (`/* TBD */` in its conversation handler), so
+during a lock the right PIN is simply refused. The app's Security tab shows
+the time left; `secctl unlock` over SSH ends a lock at once, as yourself. The
+state lives in `~/.local/state/furios-lockout/state`.
 
 ### Why the firewall asks for your network first
 

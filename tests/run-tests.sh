@@ -23,8 +23,11 @@ run() {
     if "$@"; then :; else FAILED=$((FAILED + 1)); fi
 }
 
-run "secctl: the three parts, their state and their way back" \
+run "secctl: the four parts, their state and their way back" \
     python3 "$HERE/test-secctl.py"
+
+run "pam_furios_lockout through the real libpam (own stack, own state)" \
+    python3 "$HERE/test-pam.py"
 
 printf '\n\033[1m== the generated ruleset, as nft reads it\033[0m\n'
 NFT_BIN=$(command -v nft || echo /usr/sbin/nft)

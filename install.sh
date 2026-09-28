@@ -39,6 +39,8 @@ missing=()
 have nft      || missing+=("nft (Paket nftables)")
 have ss       || missing+=("ss (Paket iproute2)")
 have modprobe || missing+=("modprobe (Paket kmod)")
+have gcc      || missing+=("gcc (Paket gcc)")
+[ -e /usr/include/security/pam_modules.h ] || missing+=("PAM headers (Paket libpam0g-dev)")
 if [ ${#missing[@]} -gt 0 ]; then
     printf 'Missing: %s\n' "${missing[@]}" >&2
     echo "Nothing was installed." >&2
@@ -57,6 +59,19 @@ sudo install -Dm644 polkit/de.misc-de.secctl.policy \
     "$POLKIT/de.misc-de.secctl.policy"
 sudo install -Dm644 README.md FINDINGS.md NOTICE -t "$DOC"
 
+# The lock-screen module. Where PAM looks first: the multiarch directory.
+# Built into a temporary file and put in place whole - PAM loads it on the
+# next unlock, and a half-copied file there would be a lock screen that no
+# longer opens once the lockout is switched on.
+PAMDIR=/usr/lib/$(gcc -print-multiarch)/security
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+gcc -shared -fPIC -O2 -Wall -Wextra -Werror -fstack-protector-strong \
+    -D_FORTIFY_SOURCE=2 -Wl,-z,relro,-z,now \
+    -o "$tmp/pam_furios_lockout.so" pam/pam_furios_lockout.c -lpam
+sudo install -Dm644 "$tmp/pam_furios_lockout.so" "$PAMDIR/pam_furios_lockout.so.new"
+sudo mv -f "$PAMDIR/pam_furios_lockout.so.new" "$PAMDIR/pam_furios_lockout.so"
+
 echo
 echo "Installed. Nothing has been switched on."
 echo
@@ -69,6 +84,7 @@ Turn it on, one part at a time or all at once:
     sudo secctl apply sysctl
     sudo secctl apply modules
     sudo secctl apply firewall
+    sudo secctl apply lockout     # lock screen: 3 wrong PINs, 5 min, 10, 15 ...
 
 The firewall refuses to come up until the home network is set - with a
 default of drop and no rule for your own subnet it would take SSH with it.
