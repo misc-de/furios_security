@@ -72,6 +72,19 @@ gcc -shared -fPIC -O2 -Wall -Wextra -Werror -fstack-protector-strong \
 sudo install -Dm644 "$tmp/pam_furios_lockout.so" "$PAMDIR/pam_furios_lockout.so.new"
 sudo mv -f "$PAMDIR/pam_furios_lockout.so.new" "$PAMDIR/pam_furios_lockout.so"
 
+# What is already on gets this version's files: an older one wrote the PAM
+# line as "requisite" (a module that fails to load after an update locked
+# every login out), the firewall unit without a start timeout and sysctl keys
+# a newer kernel may not have. Only parts that are on - nothing is switched on
+# here that was off.
+for part in sysctl firewall lockout; do
+    state=$("$BIN/secctl" status --json 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["parts"][sys.argv[1]]["state"])' "$part" 2>/dev/null)
+    if [ "$state" = on ]; then
+        sudo "$BIN/secctl" apply "$part" >/dev/null && echo "refreshed: $part"
+    fi
+done
+
 echo
 echo "Installed. Nothing has been switched on."
 echo

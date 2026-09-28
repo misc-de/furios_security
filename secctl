@@ -306,7 +306,9 @@ def sysctl_text():
              ""]
     for key, value, why in SYSCTLS:
         lines.append("# %s" % why)
-        lines.append("%s = %s" % (key, value))
+        # "-": a key a newer kernel no longer has is skipped instead of
+        # failing systemd-sysctl for all the others.
+        lines.append("-%s = %s" % (key, value))
         lines.append("")
     return "\n".join(lines)
 
@@ -477,6 +479,15 @@ def modules_revert():
 # ---------------------------------------------------------------- lockout part
 
 
+# Not "requisite": a module libpam cannot load answers PAM_MODULE_UNKNOWN,
+# and under requisite that ends every login in the stack - the lock screen,
+# sudo and pkexec alike. The file is not dpkg's, so nothing would notice a
+# FuriLabs update that breaks it. With this, a lock (PAM_AUTH_ERR) still ends
+# the attempt at once, and anything else - the module missing, failing to
+# load, or saying nothing - is ignored and pam_unix decides, as shipped.
+PAM_AUTH_CONTROL = "[success=ok ignore=ignore auth_err=die default=ignore]"
+
+
 def pam_profile_text():
     """pam-auth-update's format has no comments, so the Name line is how the
     file is recognised as ours."""
@@ -489,14 +500,15 @@ def pam_profile_text():
         "Auth:\n"
         # quiet: phosh shows no PAM messages and logs "conversation failed"
         # for each one it is sent.
-        "\trequisite\t%(m)s preauth quiet\n"
+        "\t%(c)s\t%(m)s preauth quiet\n"
         "Auth-Initial:\n"
-        "\trequisite\t%(m)s preauth quiet\n"
+        "\t%(c)s\t%(m)s preauth quiet\n"
         "Account-Type: Additional\n"
         "Account:\n"
         "\toptional\t%(m)s\n"
         "Account-Initial:\n"
-        "\toptional\t%(m)s\n" % {"m": PAM_MODULE_NAME})
+        "\toptional\t%(m)s\n" % {"m": PAM_MODULE_NAME,
+                                    "c": PAM_AUTH_CONTROL})
 
 
 def pam_profile_ours():
@@ -715,6 +727,11 @@ def unit_text():
         "[Service]",
         "Type=oneshot",
         "RemainAfterExit=yes",
+        # A oneshot has no start timeout of its own, and this one sits before
+        # sysinit.target: an nft that hangs after a kernel update would hold
+        # the whole boot. On a timeout the phone boots without our table,
+        # which is how it shipped.
+        "TimeoutStartSec=30",
         "StandardInput=null",
         "ProtectSystem=full",
         "ProtectHome=true",

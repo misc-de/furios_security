@@ -624,8 +624,9 @@ class Lockout(Base):
         mods = [next((w for w in l if w.endswith(".so")), "") for l in auth]
         self.assertLess(mods.index(self.s.PAM_MODULE_NAME),
                         [i for i, l in enumerate(auth) if "pam_unix.so" in l][0])
-        self.assertEqual(["requisite", self.s.PAM_MODULE_NAME, "preauth", "quiet"],
-                         auth[mods.index(self.s.PAM_MODULE_NAME)][1:])
+        line = [l for l in open(self.s.COMMON_AUTH) if self.s.PAM_MODULE_NAME in l][0]
+        self.assertIn(self.s.PAM_AUTH_CONTROL, line)
+        self.assertNotIn("requisite", line)
         account = open(self.s.COMMON_ACCOUNT).read()
         self.assertIn("optional\t" + self.s.PAM_MODULE_NAME, account)
         self.assertEqual(0, self.s.lockout_revert())

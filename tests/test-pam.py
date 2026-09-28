@@ -61,6 +61,12 @@ libpam.pam_acct_mgmt.argtypes = [ctypes.c_void_p, ctypes.c_int]
 libpam.pam_end.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 
+# The control secctl puts the module under - read from secctl itself, so the
+# stack tested here is the one that ends up in common-auth.
+CONTROL = next(l.split('"')[1] for l in open(os.path.join(HERE, "..", "secctl"))
+               if l.startswith("PAM_AUTH_CONTROL"))
+
+
 def login(confdir, password, service="phosh"):
     """What phosh does: pam_start, pam_authenticate, and pam_acct_mgmt only
     after a success. Returns (auth result, error messages seen)."""
@@ -119,7 +125,7 @@ class Lockout(unittest.TestCase):
         swapped for the stand-in."""
         mod = f"{self.so} dir={self.state} {args}".strip()
         with open(os.path.join(self.conf, service), "w") as f:
-            f.write(f"auth requisite {mod} preauth\n"
+            f.write(f"auth {CONTROL} {mod} preauth\n"
                     f"auth [success=1 default=ignore] pam_exec.so expose_authtok quiet {self.check}\n"
                     "auth requisite pam_deny.so\n"
                     "auth required pam_permit.so\n"
@@ -151,6 +157,19 @@ class Lockout(unittest.TestCase):
 
     def test_the_right_pin_works(self):
         self.assertEqual(PAM_SUCCESS, login(self.conf, "right")[0])
+
+    def test_a_module_that_does_not_load_locks_nobody_out(self):
+        """After an update that breaks the module: the lock screen, sudo and
+        pkexec must go on working on the PIN alone."""
+        for service in ("phosh", "sudo"):
+            with open(os.path.join(self.conf, service), "w") as f:
+                f.write(f"auth {CONTROL} /nonexistent/pam_furios_lockout.so preauth\n"
+                        f"auth [success=1 default=ignore] pam_exec.so expose_authtok quiet {self.check}\n"
+                        "auth requisite pam_deny.so\n"
+                        "auth required pam_permit.so\n"
+                        "account required pam_permit.so\n")
+            self.assertEqual(PAM_SUCCESS, login(self.conf, "right", service)[0], service)
+            self.assertEqual(PAM_AUTH_ERR, login(self.conf, "wrong", service)[0], service)
 
     def test_two_failures_do_not_lock(self):
         self.fail(2)
