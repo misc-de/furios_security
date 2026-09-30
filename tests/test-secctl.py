@@ -64,6 +64,14 @@ class Base(unittest.TestCase):
             for prefix, answer in self.answers.items():
                 if list(argv)[:len(prefix)] == list(prefix):
                     return answer
+            # Two answers are not "0, nothing", because the real programs do
+            # not give that one: nft asked for a table that is not loaded
+            # fails, and sysctl -w changes /proc - here the fake one, with
+            # the kernel's refusal to clear unprivileged_bpf_disabled.
+            if list(argv[:3]) == [self.s.NFT, "list", "table"]:
+                return (1, "Error: No such file or directory")
+            if argv[:1] == [self.s.SYSCTL] and "-w" in argv:
+                return self.fake_sysctl_w(argv)
             return (0, "")
 
         self.s.run = fake_run
@@ -79,6 +87,31 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def fake_sysctl_w(self, argv):
+        for arg in argv[argv.index("-w") + 1:]:
+            key, _, value = arg.partition("=")
+            path = os.path.join(self.tmp, "proc", "sys", key.replace(".", "/"))
+            if not os.path.exists(path):
+                if "-e" in argv:
+                    continue
+                return (255, "sysctl: cannot stat %s" % path)
+            with open(path) as fh:
+                now = fh.read().strip()
+            if key == "kernel.unprivileged_bpf_disabled" and now == "1" \
+                    and value != "1":
+                return (255, "sysctl: permission denied on key '%s'" % key)
+            with open(path, "w") as fh:
+                fh.write(value + "\n")
+        return (0, "")
+
+    def proc_value(self, key):
+        path = os.path.join(self.tmp, "proc", "sys", key.replace(".", "/"))
+        try:
+            with open(path) as fh:
+                return fh.read().strip()
+        except OSError:
+            return None
 
     def proc_sysctl(self, key, value):
         path = os.path.join(self.tmp, "proc", "sys", key.replace(".", "/"))
@@ -183,9 +216,9 @@ class SysctlRevert(Base):
             self.proc_sysctl(key, value)
         self.calls.clear()
         self.s.sysctl_revert()
-        written = [c[-1] for c in self.calls if "-w" in c]
         for key, value in booted.items():
-            self.assertIn("%s=%s" % (key, value), written)
+            self.assertEqual(value, self.proc_value(key), key)
+        written = [c[-1] for c in self.calls if "-w" in c]
         self.assertNotIn("kernel.yama.ptrace_scope=0", written)
         self.assertNotIn("kernel.perf_event_paranoid=0", written)
 

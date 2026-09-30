@@ -248,11 +248,85 @@ def config():
 
 def state():
     return load_json(STATE_FILE, {"nftables_was_enabled": None,
-                                  "sysctl_before": None})
+                                  "sysctl_before": None,
+                                  "files_before": None,
+                                  "pam_before": None,
+                                  "pam_after": None})
 
 
 def save_state(data):
     write_file(STATE_FILE, json.dumps(data, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------- the record
+#
+# The rule since 30.9.2026: before the FIRST change to anything, write down
+# what was there, and put exactly that back on revert - not what we assume
+# was there. "The kernel default is 0" was such an assumption, and it left a
+# reverted phone more open than one that never had this installed.
+#
+# Everything is kept in state.json, next to the rest of what secctl knows:
+#
+#   files_before   one entry per file secctl writes, keyed by its path
+#                  below ROOT. Always null - "was not there" - because a file
+#                  that WAS there and is not ours is refused, never
+#                  overwritten, so absence is the only original a managed
+#                  file can have. Written down anyway, so that revert knows
+#                  it rather than infers it, and so that a file we find
+#                  without an entry is recognisably an older secctl's.
+#   sysctl_before  the live value of each key, before our file set it
+#   pam_before     the files pam-auth-update rewrites, byte for byte, before
+#   pam_after      ... and as they were after our --enable
+#
+# A record is written once and never overwritten by a second apply or a
+# reinstall. It is dropped only when nothing of ours is left at that place -
+# the one exception being a sysctl the kernel will not let go of before the
+# next boot, whose record stays until it can be used.
+#
+# No record at all means the part was switched on by a secctl older than
+# this. Then revert does what it always did and says that it had nothing to
+# go by, instead of guessing silently.
+
+
+def _rel(path):
+    """The key a path is recorded under: relative to ROOT, so a record made
+    in a test root and one made on the phone read the same."""
+    if ROOT in ("/", ""):
+        return path
+    return "/" + os.path.relpath(path, ROOT)
+
+
+def remember_file(path):
+    """Note that `path` is about to be written for the first time.
+
+    Only absence can be the original here (see above); a file that exists
+    and is ours without an entry was written by an older secctl, and its
+    original is unknowable now - it is left unrecorded rather than recorded
+    wrongly as "was not there".
+    """
+    st = state()
+    files = st.get("files_before") or {}
+    key = _rel(path)
+    if key in files or os.path.exists(path):
+        return
+    files[key] = None
+    st["files_before"] = files
+    save_state(st)
+
+
+def forget_file(path):
+    """Take `path` out after revert removed it - saying so when there was
+    never a record to go by."""
+    st = state()
+    files = st.get("files_before") or {}
+    key = _rel(path)
+    if key not in files:
+        say("no record of what was at %s before secctl - removed our file "
+            "as older versions did" % path)
+        return
+    del files[key]
+    st["files_before"] = files or None
+    save_state(st)
 
 
 # ---------------------------------------------------------------- guessing
@@ -342,41 +416,81 @@ def sysctl_state():
     }
 
 
+def sysctl_keys_in_our_file():
+    """The keys our file on disk sets - what an older secctl may already
+    have changed, and whose live value therefore is not the original."""
+    if not ours(SYSCTL_FILE):
+        return set()
+    found = set()
+    for line in (read_file(SYSCTL_FILE) or "").splitlines():
+        match = re.match(r"^-?\s*([\w.]+)\s*=", line)
+        if match:
+            found.add(match.group(1))
+    return found
+
+
 def sysctl_apply():
-    # What the kernel had before our file, kept once so revert can put
-    # exactly that back. Not on a re-apply: the live values are ours then.
+    if os.path.exists(SYSCTL_FILE) and not ours(SYSCTL_FILE):
+        say("%s was not written by us - left alone, sysctl not applied."
+            % SYSCTL_FILE)
+        return 1
+    # What the kernel had before we set it, one key at a time and once: a
+    # key already in the record keeps its first value (a second apply, a
+    # reinstall, install.sh refreshing a part that is on - the live value is
+    # ours by then), and so does a key our file on disk already sets
+    # without a record, because that value came from an older secctl. A key
+    # a newer version adds is still recorded, although the file is ours:
+    # the old file never touched it. A key this kernel does not have is not
+    # recorded: there is nothing to put back.
     st = state()
-    if st.get("sysctl_before") is None and not ours(SYSCTL_FILE):
-        st["sysctl_before"] = {key: sysctl_live(key) for key, _v, _w in SYSCTLS
-                               if sysctl_live(key) is not None}
+    before = dict(st.get("sysctl_before") or {})
+    already = sysctl_keys_in_our_file()
+    for key, _want, _why in SYSCTLS:
+        if key not in before and key not in already:
+            live = sysctl_live(key)
+            if live is not None:
+                before[key] = live
+    if before != (st.get("sysctl_before") or {}):
+        st["sysctl_before"] = before
         save_state(st)
+    remember_file(SYSCTL_FILE)
     write_file(SYSCTL_FILE, sysctl_text())
-    rc, out = run([SYSCTL, "-q", "--system"])
-    # sysctl --system walks every file in /etc/sysctl.d, so a complaint from
-    # somebody else's is not this failing. Only our own keys decide.
+    # Our keys only, not "sysctl --system": that re-reads every file in
+    # /etc/sysctl.d and puts back whatever somebody set at runtime for keys
+    # that are none of our business - a change nobody recorded and revert
+    # could never take back. -e: a key this kernel does not have is not an
+    # error; the file says the same with its "-".
+    out = []
+    for key, want, _why in SYSCTLS:
+        _rc, text = run([SYSCTL, "-q", "-e", "-w", "%s=%s" % (key, want)])
+        if text.strip():
+            out.append(text.strip())
     bad = [k for k, v in sysctl_state()["keys"].items()
            if v["ok"] is False]
     if bad:
         say("did not take effect: " + ", ".join(bad))
-        if out.strip():
-            say(out.strip())
+        if out:
+            say("\n".join(out))
         return 1
     return 0
 
 
 def sysctl_revert():
-    """The file goes, and the values go back to what the kernel boots with.
+    """The file goes, and each value goes back to what it was before apply.
 
-    Not every one of them can: kernel.unprivileged_bpf_disabled is one-way -
-    once set it cannot be cleared without a reboot, by design, so that
-    an exploit cannot undo it either. That is said plainly rather than
-    reported as a failure.
+    Only where the value is still ours: a key somebody set to something else
+    since is theirs now, and is reported rather than overwritten. And not
+    every one can: kernel.unprivileged_bpf_disabled is one-way - once set it
+    cannot be cleared without a reboot, by design, so that an exploit cannot
+    undo it either. That is said plainly rather than reported as a failure,
+    and its record stays until the boot that clears it.
     """
     if os.path.exists(SYSCTL_FILE) and not ours(SYSCTL_FILE):
         say("%s was not written by us - left alone." % SYSCTL_FILE)
         return 1
     if os.path.exists(SYSCTL_FILE):
         os.unlink(SYSCTL_FILE)
+        forget_file(SYSCTL_FILE)
     # Back to what was there before apply - not to 0. 0 is not what this
     # kernel boots with: it has Yama's ptrace_scope at 1 and
     # PERF_EVENTS_RESTRICT's perf_event_paranoid at 3, and writing 0 left a
@@ -385,22 +499,34 @@ def sysctl_revert():
     # the boot after this puts the kernel's own back.
     st = state()
     before = st.get("sysctl_before") or {}
-    stuck, kept = [], []
+    keep = {}
+    stuck, kept, theirs = [], [], []
     for key, want, _why in SYSCTLS:
-        if key == "kernel.unprivileged_bpf_disabled":
-            if sysctl_live(key) == "1" and before.get(key) != "1":
-                stuck.append(key)
+        live = sysctl_live(key)
+        if key not in before:
+            if live == want:
+                kept.append(key)
             continue
-        if key in before:
-            run([SYSCTL, "-q", "-w", "%s=%s" % (key, before[key])])
-        else:
-            kept.append(key)
-    run([SYSCTL, "-q", "--system"])
-    st["sysctl_before"] = None
+        original = before[key]
+        if original is None or live is None or live == original:
+            # Not on this kernel, not readable, or already back.
+            continue
+        if live != want:
+            theirs.append("%s (now %s, was %s)" % (key, live, original))
+            continue
+        if key == "kernel.unprivileged_bpf_disabled":
+            stuck.append(key)
+            keep[key] = original
+            continue
+        run([SYSCTL, "-q", "-w", "%s=%s" % (key, original)])
+    st["sysctl_before"] = keep or None
     save_state(st)
     if stuck:
         say("still on until the next boot (the kernel will not let it be "
             "cleared): " + ", ".join(stuck))
+    if theirs:
+        say("changed by somebody else since - left as it is: "
+            + ", ".join(theirs))
     if kept:
         say("left as they are until the next boot (no record of what was "
             "there before): " + ", ".join(kept))
