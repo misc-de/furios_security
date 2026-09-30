@@ -89,6 +89,38 @@ Reading needs no root. Changing does.
 sudo secctl revert all     # or ./uninstall.sh, which does this first
 ```
 
+What comes back is what was written down before the first change, not what
+is assumed to have been there. Nothing is guessed:
+
+| change | recorded before the first change | on revert / uninstall |
+|---|---|---|
+| each sysctl key | its live value (`sysctl_before`) | written back, only while the value is still ours; one changed since is left and named |
+| `/etc/sysctl.d/99-furios-hardening.conf`, `/etc/modprobe.d/99-furios-hardening.conf`, `/etc/systemd/system/furios-firewall.service`, `firewall.nft`, `/usr/share/pam-configs/furios-lockout` | that nothing was there (`files_before`) - a file of somebody else's at these paths is refused, never overwritten | removed |
+| the table `inet furios`, the unit's enable link | that there was none - one we did not create is refused | deleted, disabled |
+| `/etc/pam.d/common-*`, `/var/lib/pam/*` | byte for byte with modes (`pam_before`), and again after our `--enable` (`pam_after`) | `pam-auth-update --remove`, then whatever still differs is written back from the record - all files or none, and only if none was changed by somebody else since |
+| everything `install.sh` puts down | one line per path in `/etc/furios-security/installed/list`: `absent`, `saved` (a copy of somebody else's file), `older`, and each directory it created | put back or removed, only while the file is still ours; created directories go when empty |
+
+The records live in `/etc/furios-security/state.json` (secctl) and
+`/etc/furios-security/installed/` (install.sh). A record is written once and
+never overwritten by a second apply or a reinstall. Where there is none - a
+part switched on, or files installed, by a version before 30.9.2026 - revert
+and uninstall do what they always did and say that they had nothing to go
+by.
+
+`sysctl` apply writes our six keys and nothing else; it no longer runs
+`sysctl --system`, which re-reads every file in `/etc/sysctl.d`.
+
+`secctl revert all` goes on past a part that refuses and fails at the end.
+`uninstall.sh` stops before removing anything when a part could not be
+taken back - secctl and its records stay, so it can still finish;
+`./uninstall.sh --force` removes everything anyway.
+
+Not recorded, and why: pam-auth-update's debconf answer (`--remove` takes our
+name out of it again); `~/.local/state` and `~/.local`, which the module
+creates with 0700 only if an account has neither - uninstall removes
+`~/.local/state/furios-lockout` and leaves the parents, which almost every
+account has anyway.
+
 The firewall comes up from its own unit, `furios-firewall.service`, which
 revert disables and removes. `/etc/nftables.conf` and `nftables.service` are
 never touched: the file is a conffile of the nftables package, and changing
@@ -113,6 +145,11 @@ on the phone.
 ./tests/run-tests.sh       # NEVER with sudo
 ```
 
-52 tests against a temporary `/etc`; nothing touches the live firewall.
+Everything against temporary roots; nothing touches the live firewall, the
+kernel or `/etc`. `test-invariant.py` and `test-install-roundtrip.py` check
+the rule above from the outside: a picture of the whole root before, and
+after on/off or install/uninstall, must be the same. The roundtrip runs
+`install.sh` and `uninstall.sh` themselves with `DESTDIR` and `sudo` as
+`unshare -r` (root in a user namespace of its own, never the real sudo).
 
 MIT, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
