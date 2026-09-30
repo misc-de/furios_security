@@ -99,6 +99,17 @@ PAM_PROFILE = _p("usr/share/pam-configs", PAM_PROFILE_NAME)
 PAM_MODULE_NAME = "pam_furios_lockout.so"
 COMMON_AUTH = _p("etc/pam.d/common-auth")
 COMMON_ACCOUNT = _p("etc/pam.d/common-account")
+# Everything pam-auth-update rewrites when a profile is enabled or removed:
+# all five common-* files - it regenerates them together, not just the two
+# our profile appears in - and its own copies of them plus the list of
+# profiles it has seen, in /var/lib/pam. Recorded byte for byte before our
+# first --enable. (Its debconf answer is the one thing it writes that is not
+# a file here; --remove takes our name out of that again.)
+PAM_FILES = [_p("etc/pam.d", n) for n in (
+    "common-auth", "common-account", "common-password", "common-session",
+    "common-session-noninteractive")] + [_p("var/lib/pam", n) for n in (
+        "auth", "account", "password", "session", "session-noninteractive",
+        "seen")]
 PAM_AUTH_UPDATE = os.environ.get("FURIOS_SECURITY_PAM_AUTH_UPDATE",
                                  "/usr/sbin/pam-auth-update")
 LOCKOUT_SCHEDULE = (5, 10, 15, 30, 60, 120, 240, 480)
@@ -731,6 +742,19 @@ def lockout_state():
     }
 
 
+def pam_snapshot():
+    """{path: {"text": content or None when absent, "mode": mode}} of every
+    file pam-auth-update rewrites."""
+    snap = {}
+    for path in PAM_FILES:
+        try:
+            mode = os.stat(path).st_mode & 0o7777
+        except OSError:
+            mode = None
+        snap[_rel(path)] = {"text": read_file(path), "mode": mode}
+    return snap
+
+
 def lockout_apply():
     module = pam_module()
     if module is None:
@@ -742,6 +766,27 @@ def lockout_apply():
     if os.path.exists(PAM_PROFILE) and not pam_profile_ours():
         say("%s was not written by us - left alone." % PAM_PROFILE)
         return 1
+    # The login stack as it was, before the first --enable. Only when our
+    # module is not in it yet: named there without a record, it was put in
+    # by an older secctl and what was there before is not known any more.
+    # And on a second apply the record stays - unless somebody changed the
+    # files since our --enable (a package that brought its own profile, say):
+    # then the record describes a stack that no longer exists, and putting
+    # it back would take their profile out. It is dropped, and revert falls
+    # back to pam-auth-update --remove.
+    # A record without an "after" is one whose --enable never went through;
+    # with our module still out of the stack it is simply taken again.
+    st = state()
+    if st.get("pam_before") is not None and st.get("pam_after") is not None \
+            and st["pam_after"] != pam_snapshot():
+        say("the login stack changed since the lockout was switched on - the "
+            "record of what was there before no longer applies, dropped")
+        st["pam_before"] = st["pam_after"] = None
+        save_state(st)
+    elif st.get("pam_after") is None and not lockout_in_stack():
+        st["pam_before"] = pam_snapshot()
+        save_state(st)
+    remember_file(PAM_PROFILE)
     write_file(PAM_PROFILE, pam_profile_text())
     rc, out = pam_auth_update("--enable", PAM_PROFILE_NAME)
     if rc != 0 or not lockout_in_stack():
@@ -749,13 +794,55 @@ def lockout_apply():
         # usual one: pam-auth-update will not overwrite a hand-edited file.
         say("pam-auth-update did not take it: %s" % out.strip())
         return 1
+    st = state()
+    if st.get("pam_before") is not None:
+        st["pam_after"] = pam_snapshot()
+        save_state(st)
     return 0
+
+
+def pam_restore(before, after):
+    """Put the login stack back exactly as recorded, if it is still ours.
+
+    Runs after pam-auth-update --remove, which normally produces the
+    original already: the common-* files are generated from the profiles,
+    and those are the same as before. What it does not put back is
+    /var/lib/pam/seen, which keeps our name. Anything else that differs
+    from the record is written back from it too.
+
+    All or nothing, and only when every file was, at the start of this
+    revert, exactly what our --enable left (`unchanged`): common-* and
+    /var/lib/pam are one piece to pam-auth-update - restore one without
+    the other and its next run sees "local modifications" and refuses to
+    update the stack ever again - and a file somebody changed after us is
+    theirs. Each write is whole or not at all (write_file), with the
+    original's mode. Returns the files that differ and were left.
+    """
+    wrong = [p for p in PAM_FILES
+             if _rel(p) in before and read_file(p) != before[_rel(p)]["text"]]
+    if not wrong:
+        return []
+    if not after:
+        return wrong
+    for path in wrong:
+        rec = before[_rel(path)]
+        if rec["text"] is None:
+            os.unlink(path)
+        else:
+            write_file(path, rec["text"], rec["mode"] or 0o644)
+    return []
 
 
 def lockout_revert():
     if os.path.exists(PAM_PROFILE) and not pam_profile_ours():
         say("%s was not written by us - left alone." % PAM_PROFILE)
         return 1
+    st = state()
+    before, after = st.get("pam_before"), st.get("pam_after")
+    # Before --remove touches anything: is every file still what our
+    # --enable left? Only then may the record be written back.
+    unchanged = bool(before and after and pam_snapshot() == after)
+    was_on = lockout_in_stack()
     if os.path.exists(PAM_PROFILE) or lockout_in_stack():
         rc, out = pam_auth_update("--remove", PAM_PROFILE_NAME)
         if rc != 0:
@@ -763,8 +850,27 @@ def lockout_revert():
             return 1
     if os.path.exists(PAM_PROFILE):
         os.unlink(PAM_PROFILE)
+        forget_file(PAM_PROFILE)
     if lockout_in_stack():
         say("%s is still named in /etc/pam.d/common-* - edited by hand?"
+            % PAM_MODULE_NAME)
+        return 1
+    if before:
+        left = pam_restore(before, after if unchanged else None)
+        if left:
+            say("changed by somebody else since the lockout was switched on - "
+                "left as pam-auth-update --remove wrote them: "
+                + ", ".join(left))
+        st = state()
+        st["pam_before"] = st["pam_after"] = None
+        save_state(st)
+    elif was_on:
+        say("no record of the login stack before the lockout (switched on by "
+            "an older secctl) - left as pam-auth-update --remove wrote it")
+    # A last look after any write-back: the stack must not name the module
+    # (the record never does - it was taken with the module out).
+    if lockout_in_stack():
+        say("%s is named in /etc/pam.d/common-* again - check it by hand"
             % PAM_MODULE_NAME)
         return 1
     return 0
