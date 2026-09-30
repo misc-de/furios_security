@@ -589,6 +589,15 @@ def modules_state():
 
 
 def modules_apply():
+    # Refused, not overwritten: revert would otherwise delete a file that was
+    # somebody else's, with nothing left to put back. It only ever blocks
+    # FUTURE loads - a module already loaded stays loaded, so there is no
+    # live state here to record or restore.
+    if os.path.exists(MODPROBE_FILE) and not ours(MODPROBE_FILE):
+        say("%s was not written by us - left alone, modules not applied."
+            % MODPROBE_FILE)
+        return 1
+    remember_file(MODPROBE_FILE)
     write_file(MODPROBE_FILE, modprobe_text())
     return 0
 
@@ -599,6 +608,7 @@ def modules_revert():
         return 1
     if os.path.exists(MODPROBE_FILE):
         os.unlink(MODPROBE_FILE)
+        forget_file(MODPROBE_FILE)
     return 0
 
 
@@ -886,6 +896,8 @@ def restore_nft_conf():
         write_file(NFT_CONF, original)
         os.unlink(NFT_BACKUP)
     else:
+        say("no copy of the original %s was kept - removed the one an older "
+            "secctl wrote" % NFT_CONF)
         os.unlink(NFT_CONF)
     st = state()
     if st.get("nftables_was_enabled") is False:
@@ -945,11 +957,35 @@ def firewall_apply():
             say("\nSet it with:      sudo secctl lan 192.168.0.0/24")
         return 1
 
-    if os.path.exists(UNIT_FILE) and not ours(UNIT_FILE):
-        say("%s was not written by us - left alone, firewall not applied."
-            % UNIT_FILE)
-        return 1
+    for path in (FIREWALL_FILE, UNIT_FILE):
+        if os.path.exists(path) and not ours(path):
+            say("%s was not written by us - left alone, firewall not applied."
+                % path)
+            return 1
 
+    # The first time, the table and the unit we are about to create must not
+    # exist yet: our revert deletes the table "inet furios" and disables the
+    # unit of our name, and if either was somebody else's there would be no
+    # way to put it back. Refused rather than recorded, like a foreign file -
+    # so "there was none" is the original, by construction. A table loaded
+    # by an older secctl (the one that rewrote nftables.conf) is ours.
+    if not ours(FIREWALL_FILE) and not ours(UNIT_FILE):
+        rc, _out = run([NFT, "list", "table", "inet", "furios"])
+        if rc == 0 and not ours(NFT_CONF):
+            say("A table \"inet furios\" is loaded that secctl did not write "
+                "- left alone, firewall not applied.")
+            return 1
+        _rc, out = run([SYSTEMCTL, "is-enabled", UNIT_NAME])
+        if out.strip() in ("enabled", "enabled-runtime", "disabled", "static",
+                           "masked", "masked-runtime", "linked",
+                           "linked-runtime", "alias", "indirect",
+                           "generated", "transient"):
+            say("A unit %s exists already (%s) that secctl did not write - "
+                "left alone, firewall not applied." % (UNIT_NAME, out.strip()))
+            return 1
+
+    remember_file(FIREWALL_FILE)
+    remember_file(UNIT_FILE)
     write_file(FIREWALL_FILE, firewall_text(cfg))
     write_file(UNIT_FILE, unit_text())
     restore_nft_conf()
@@ -977,9 +1013,11 @@ def firewall_revert():
     if os.path.exists(UNIT_FILE):
         run([SYSTEMCTL, "disable", UNIT_NAME])
         os.unlink(UNIT_FILE)
+        forget_file(UNIT_FILE)
         run([SYSTEMCTL, "daemon-reload"])
     if os.path.exists(FIREWALL_FILE):
         os.unlink(FIREWALL_FILE)
+        forget_file(FIREWALL_FILE)
     restore_nft_conf()
     return 0
 
