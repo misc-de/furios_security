@@ -1251,18 +1251,29 @@ def do(which, table, verb):
     Stops at the first failure and says which part that was. A half-applied
     state reported as success is the one outcome a tool like this must not
     produce - somebody would believe the firewall is up.
+
+    Revert is the exception: it goes on to the next part and fails at the
+    end. Taking things back is the safe direction, and uninstall.sh runs
+    "revert all" - stopping at a sysctl file somebody else wrote there left
+    the modules, the firewall and the PAM lockout on, with the program that
+    knew how to take them back about to be deleted.
     """
     names = PARTS if which in (None, "all") else (which,)
+    failed = 0
     for name in names:
         if name not in table:
             say("unknown part: %s (try: %s)" % (name, ", ".join(PARTS)))
             return 2
         rc = table[name]()
         if rc != 0:
+            if verb == "reverted":
+                say("%s: %s did not go through." % (verb, name))
+                failed = failed or rc
+                continue
             say("%s: %s did not go through - stopping here." % (verb, name))
             return rc
         say("%s: %s" % (verb, name))
-    return 0
+    return failed
 
 
 USAGE = """secctl - kernel hardening for the FuriPhone
