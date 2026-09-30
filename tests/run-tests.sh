@@ -26,6 +26,9 @@ run() {
 run "secctl: the four parts, their state and their way back" \
     python3 "$HERE/test-secctl.py"
 
+run "on, then off: the phone as it was (records, not assumptions)" \
+    python3 "$HERE/test-invariant.py"
+
 run "pam_furios_lockout through the real libpam (own stack, own state)" \
     python3 "$HERE/test-pam.py"
 
