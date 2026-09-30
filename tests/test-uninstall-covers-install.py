@@ -79,8 +79,11 @@ def tokens(line):
 
 
 def commands(text):
-    """Each simple command as a token list, sudo and redirections removed."""
-    env = {}
+    """Each simple command as a token list, sudo and redirections removed.
+
+    DESTDIR is empty: that is how both scripts run on the phone (the tests
+    set it to a temporary root)."""
+    env = {"DESTDIR": ""}
     for line in logical_lines(text):
         line = substitute(line, env)
         m = re.match(r"^\s*([A-Za-z_]\w*)=(\S+)\s*$", line)
@@ -182,6 +185,13 @@ def removed(text):
                     (trees if recursive else files).append(a)
         elif prog == "rmdir":
             dirs += [a for a in argv[1:] if absolute(a)]
+        elif prog == "put_back":
+            # uninstall.sh's own helper: put_back <signature> <path>... puts
+            # back what install.sh's record says was there, or removes ours.
+            # Taking it at its word here is fine because
+            # test-install-roundtrip.py runs both scripts for real and
+            # compares the whole root before and after.
+            files += [a for a in argv[2:] if absolute(a)]
         elif prog == "systemctl" and "disable" in argv:
             disabled += [a for a in argv[argv.index("disable") + 1:]
                          if not a.startswith("-")]
