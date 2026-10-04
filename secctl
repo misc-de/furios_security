@@ -1168,6 +1168,54 @@ def exposure():
     return {"readable": True, "open": found}
 
 
+class Report:
+    """The status lines every misc-de ctl prints, modemctl's form: a heading
+    per part, then ok / FAIL / warn / -- in front of each line, colour only
+    when somebody is watching, and one closing line that names the fix. The
+    exit code says whether something that is on is not working - not
+    whether something is off, which is a choice."""
+
+    def __init__(self):
+        tty = sys.stdout.isatty()
+        self.c = {"ok": "\033[32m", "bad": "\033[31m", "warn": "\033[33m",
+                  "b": "\033[1m", "0": "\033[0m"} if tty else \
+            {"ok": "", "bad": "", "warn": "", "b": "", "0": ""}
+        self.problems = 0
+        self.parts = []
+        self.first = True
+
+    def head(self, text):
+        say("%s%s== %s%s" % ("" if self.first else "\n", self.c["b"], text,
+                             self.c["0"]))
+        self.first = False
+
+    def ok(self, text):
+        say("  %sok%s    %s" % (self.c["ok"], self.c["0"], text))
+
+    def bad(self, text, part=None):
+        say("  %sFAIL%s  %s" % (self.c["bad"], self.c["0"], text))
+        self.problems += 1
+        if part and part not in self.parts:
+            self.parts.append(part)
+
+    def warn(self, text):
+        say("  %swarn%s  %s" % (self.c["warn"], self.c["0"], text))
+
+    def skip(self, text):
+        say("  --    %s" % text)
+
+    def note(self, text):
+        say("        %s" % text)
+
+    def summary(self, fine, fix):
+        say("")
+        if not self.problems:
+            say(fine)
+            return 0
+        say("%d problem(s) - fix with: %s" % (self.problems, fix(self.parts)))
+        return 1
+
+
 def overall(parts):
     values = [parts[name]["state"] for name in PARTS]
     if all(v == "on" for v in values):
@@ -1185,64 +1233,102 @@ def status(as_json=False):
         say(json.dumps(data, indent=2))
         return 0
 
+    rep = Report()
+
+    rep.head("sysctl")
     sysctl = parts["sysctl"]
-    say("sysctl   %s" % sysctl["state"])
-    for key, info in sysctl["keys"].items():
-        mark = "ok " if info["ok"] else "   " if info["ok"] is None else "OFF"
-        shown = info["is"] if info["is"] is not None else "not readable (root)"
-        say("  %s %-38s %s" % (mark, key, shown))
+    if not sysctl["ours"]:
+        rep.skip("off - sudo secctl set sysctl on")
+    else:
+        for key, info in sysctl["keys"].items():
+            if info["ok"] is None:
+                rep.skip("%s: not readable without root" % key)
+            elif info["ok"]:
+                rep.ok("%s = %s" % (key, info["is"]))
+            else:
+                rep.bad("%s = %s, wants %s" % (key, info["is"], info["want"]),
+                        part="sysctl")
 
+    rep.head("modules")
     mods = parts["modules"]
-    unknown = sum(1 for v in mods["modules"].values() if v is None)
-    blocked = sum(1 for v in mods["modules"].values() if v)
-    say("")
-    say("modules  %s  (%d of %d blocked%s)"
-        % (mods["state"], blocked, mods["count"],
-           ", %d unanswered" % unknown if unknown else ""))
+    unknown = [n for n, v in mods["modules"].items() if v is None]
+    loose = [n for n, v in mods["modules"].items() if v is False]
+    if not mods["ours"]:
+        rep.skip("off - sudo secctl set modules on")
+    elif loose:
+        rep.bad("%d of %d blocked - not: %s"
+                % (mods["count"] - len(loose) - len(unknown), mods["count"],
+                   ", ".join(loose)), part="modules")
+    elif unknown:
+        rep.skip("%d of %d blocked, %d not readable without root"
+                 % (mods["count"] - len(unknown), mods["count"], len(unknown)))
+    else:
+        rep.ok("%d of %d blocked" % (mods["count"], mods["count"]))
 
+    rep.head("firewall")
     fw = parts["firewall"]
-    say("")
-    say("firewall %s" % fw["state"])
-    say("  rules at boot   %s" % ("yes" if fw["conf"] and fw["service"]
-                                  else "no"))
-    say("  loaded now      %s" % ("yes" if fw["live"] else "no"
-                                  if fw["live"] is False else
-                                  "not readable without root"))
-    say("  home network    %s" % (fw["lan"] or "not set - see: secctl lan"))
+    half = (fw["ours"] or fw["conf"] or fw["service"]) and fw["state"] != "on"
+    if fw["state"] == "on":
+        rep.ok("rules loaded at boot")
+        if fw["live"] is None:
+            rep.skip("loaded now: not readable without root")
+        elif fw["live"]:
+            rep.ok("loaded now")
+        else:
+            rep.bad("not loaded now", part="firewall")
+    elif half:
+        rep.bad("half in place - rules %s, unit %s, %s"
+                % ("ours" if fw["ours"] else "missing",
+                   "ours" if fw["conf"] else "missing",
+                   "enabled" if fw["service"] else "not enabled"),
+                part="firewall")
+    else:
+        rep.skip("off - sudo secctl set firewall on")
+    if fw["lan"]:
+        rep.ok("home network %s" % fw["lan"])
+    else:
+        rep.skip("home network not set - secctl lan <cidr>")
 
+    rep.head("lockout")
     lo = parts["lockout"]
-    say("")
-    say("lockout  %s  (lock screen: 3 wrong PINs lock it for %s min)"
-        % (lo["state"], ", ".join(str(m) for m in lo["schedule"])))
-    if not lo["module"]:
-        say("  module          not installed - run install.sh")
+    schedule = ", ".join(str(m) for m in lo["schedule"])
+    if lo["state"] == "on":
+        rep.ok("lock screen: 3 wrong PINs lock it for %s min" % schedule)
+    elif lo["state"] == "partial":
+        rep.bad("in the PAM stack, but the module is not installed - run install.sh"
+                if not lo["module"] else "half in place", part="lockout")
+    else:
+        rep.skip("off - sudo secctl set lockout on")
     user = lo["user"]
     if user and user["locked_for"]:
-        say("  locked now      %d:%02d left" % divmod(user["locked_for"], 60))
+        rep.warn("locked now - %d:%02d left (secctl unlock)"
+                 % divmod(user["locked_for"], 60))
     elif user and (user["failures"] or user["locks"]):
-        say("  since unlocking %d failed, %d lock(s)"
-            % (user["failures"], user["locks"]))
+        rep.skip("since unlocking %d failed, %d lock(s)"
+                 % (user["failures"], user["locks"]))
 
+    rep.head("listening beyond loopback")
     exp = data["exposure"]
-    say("")
     if not exp["readable"]:
-        say("listening ports could not be read")
+        rep.skip("listening ports could not be read")
     elif not exp["open"]:
-        say("nothing listens outside loopback")
+        rep.ok("nothing listens outside loopback")
     else:
-        say("listening beyond loopback:")
         for entry in exp["open"]:
-            say("  %-4s %s:%s%s" % (entry["proto"], entry["addr"],
-                                    entry["port"],
-                                    "   (every interface)" if entry["any"]
-                                    else ""))
+            rep.skip("%-4s %s:%s%s" % (entry["proto"], entry["addr"],
+                                       entry["port"],
+                                       "   (every interface)" if entry["any"]
+                                       else ""))
         if fw["state"] == "on":
-            say("  - the chain lets through only what is listed above it; "
-                "the rest is dropped.")
+            rep.note("the chain lets through only what is listed above it; "
+                     "the rest is dropped")
         else:
-            say("  - with the firewall off these are reachable from every "
-                "network this phone joins, mobile included.")
-    return 0
+            rep.note("with the firewall off these are reachable from every "
+                     "network this phone joins, mobile included")
+
+    return rep.summary(
+        "everything that is switched on is in place",
+        lambda parts_: "sudo secctl apply %s" % " ".join(parts_))
 
 
 def do(which, table, verb):

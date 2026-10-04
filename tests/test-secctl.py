@@ -491,6 +491,63 @@ class Root(Base):
         self.assertEqual(self.s.main(["secctl", "lan", "192.168.0.0/24"]), 1)
 
 
+class StatusText(Base):
+    """The human status: modemctl's form, and an exit code that means
+    "something that is on does not work" - never "something is off"."""
+
+    def status(self, **parts):
+        def part(name, value):
+            return lambda: value
+        base = {
+            "sysctl": {"ours": True, "state": "on", "keys": {
+                "kernel.kptr_restrict": {"want": "2", "is": "2", "why": "", "ok": True}}},
+            "modules": {"ours": True, "state": "on", "count": 2,
+                        "modules": {"a": True, "b": True}},
+            "firewall": {"ours": False, "conf": False, "service": False,
+                         "live": None, "lan": "", "iface": "", "state": "off"},
+            "lockout": {"module": True, "profile": True, "enabled": True,
+                        "schedule": [5, 10], "user": None, "state": "on"},
+        }
+        base.update(parts)
+        self.s.STATE = {n: part(n, v) for n, v in base.items()}
+        self.s.exposure = lambda: {"readable": True, "open": []}
+        out = []
+        self.s.say = lambda *t: out.append(" ".join(str(x) for x in t))
+        rc = self.s.main(["secctl", "status"])
+        return rc, "\n".join(out)
+
+    def test_all_good(self):
+        rc, out = self.status()
+        self.assertEqual(rc, 0)
+        self.assertIn("== sysctl", out)
+        self.assertIn("  ok    kernel.kptr_restrict = 2", out)
+        self.assertIn("  --    off - sudo secctl set firewall on", out)
+        self.assertIn("everything that is switched on is in place", out)
+
+    def test_off_is_not_a_failure(self):
+        rc, out = self.status(sysctl={"ours": False, "state": "off", "keys": {
+            "kernel.kptr_restrict": {"want": "2", "is": "0", "why": "", "ok": False}}})
+        self.assertEqual(rc, 0)
+        self.assertNotIn("FAIL", out)
+
+    def test_unreadable_is_not_a_failure(self):
+        rc, out = self.status(sysctl={"ours": True, "state": "on", "keys": {
+            "net.core.bpf_jit_harden": {"want": "2", "is": None, "why": "", "ok": None}}})
+        self.assertEqual(rc, 0)
+        self.assertIn("  --    net.core.bpf_jit_harden: not readable without root", out)
+
+    def test_on_but_not_working_fails_and_names_the_fix(self):
+        rc, out = self.status(modules={"ours": True, "state": "partial", "count": 2,
+                                       "modules": {"a": True, "b": False}})
+        self.assertEqual(rc, 1)
+        self.assertIn("  FAIL  1 of 2 blocked - not: b", out)
+        self.assertIn("1 problem(s) - fix with: sudo secctl apply modules", out)
+
+    def test_no_colour_without_a_terminal(self):
+        rc, out = self.status()
+        self.assertNotIn("\033[", out)
+
+
 class Cli(Base):
     def test_set_on_applies_one_part(self):
         self.assertEqual(self.s.main(["secctl", "set", "modules", "on"]), 0)
