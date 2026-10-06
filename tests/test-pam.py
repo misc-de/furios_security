@@ -193,8 +193,8 @@ class Lockout(unittest.TestCase):
         self.age(301)
         self.assertEqual(PAM_SUCCESS, login(self.conf, "right")[0])
 
-    def test_each_lock_is_longer_5_10_15_30_60(self):
-        want = [5, 10, 15, 30, 60, 120, 240, 480, 480]
+    def test_each_lock_is_longer_then_doubles_past_the_schedule(self):
+        want = [5, 10, 15, 30, 60, 120, 240, 480, 960, 1920, 3840]
         got = []
         for _ in want:
             self.fail(3)
@@ -213,11 +213,61 @@ class Lockout(unittest.TestCase):
         login(self.conf, "right")
         self.assertEqual(300, self.read()[3], "second series did not start at 5")
 
-    def test_failures_far_apart_are_forgotten(self):
+    def test_failures_far_apart_still_count(self):
+        """A slow guesser must not get 3 tries every 15 minutes forever."""
         self.fail(2)
         self.age(901)
         self.fail(1)
+        self.assertEqual(PAM_AUTH_ERR, login(self.conf, "right")[0])
+        self.assertEqual(300, self.read()[3])
+
+    def test_slow_guessing_escalates_across_locks(self):
+        """One failure a day, each lock waited out: the ladder still climbs."""
+        want = [5, 10, 15, 30]
+        got = []
+        for _ in want:
+            for _ in range(2):
+                self.fail(1)
+                self.age(86400)
+            self.fail(1)
+            login(self.conf, "wrong")           # meets the lock, if any
+            got.append(self.read()[3] // 60)
+            self.age(self.read()[3] + 1)
+        self.assertEqual(want, got)
+
+    def test_the_doubling_saturates_at_a_year(self):
+        now = int(time.time())
+        os.makedirs(os.path.dirname(self.statefile()), exist_ok=True)
+        self.write(3, 10**15, 0, 0, now)
+        login(self.conf, "wrong")
+        self.assertEqual(365 * 24 * 3600, self.read()[3])
+
+    def test_a_success_after_a_doubled_lock_starts_over(self):
+        now = int(time.time())
+        os.makedirs(os.path.dirname(self.statefile()), exist_ok=True)
+        self.write(2, 12, 0, 0, now)
         self.assertEqual(PAM_SUCCESS, login(self.conf, "right")[0])
+        self.assertEqual([0, 0, 0, 0, 0], self.read())
+        self.fail(3)
+        login(self.conf, "wrong")
+        self.assertEqual(300, self.read()[3])
+
+    def test_an_old_interval_argument_still_loads_and_is_ignored(self):
+        self.stack("phosh", "interval=900")
+        self.fail(2)
+        self.age(901)
+        self.fail(1)
+        self.assertEqual(PAM_AUTH_ERR, login(self.conf, "right")[0])
+
+    def test_a_short_schedule_doubles_its_last_step(self):
+        self.stack("phosh", "deny=1 schedule=1,2")
+        got = []
+        for _ in range(4):
+            self.fail(1)
+            login(self.conf, "wrong")
+            got.append(self.read()[3] // 60)
+            self.age(self.read()[3] + 1)
+        self.assertEqual([1, 2, 4, 8], got)
 
     def test_the_lock_runs_from_the_third_failure(self):
         self.fail(3)

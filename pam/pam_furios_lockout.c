@@ -3,7 +3,11 @@
 //
 // Locks the phosh lock screen for a while after failed attempts, a little
 // longer each time: after 3 failures 5 minutes, then 10, 15, 30, 60, 120,
-// 240, and 480 from then on. A successful unlock starts over.
+// 240, 480, and from there each lock twice the one before - 16 hours, 32,
+// 64, ... - up to a ceiling of one year (MAX_LOCK), which is there only so
+// the arithmetic cannot overflow. Failures are never forgotten because time
+// passed: a guesser who waits out every lock, or spaces the attempts days
+// apart, climbs the same ladder. Only a successful unlock starts over.
 //
 // Why not pam_faillock: its lock time is fixed. And why this shape - one
 // line before pam_unix, one in the account stack - rather than faillock's
@@ -26,8 +30,13 @@
 // Arguments:
 //   preauth            in the auth stack: check the lock, count the attempt
 //   deny=N             failures before a lock (default 3)
-//   schedule=a,b,...   lock lengths in minutes (default 5,10,15,30,60,120,240,480)
-//   interval=S         failures further apart than this are forgotten (900)
+//   schedule=a,b,...   lock lengths in minutes (default 5,10,15,30,60,120,240,480);
+//                      past the last one, each lock doubles
+//   interval=S         accepted and ignored. It used to forget failures
+//                      further apart than S seconds, which let a slow guesser
+//                      try 3 PINs every 15 minutes forever without ever
+//                      reaching a longer lock. Still parsed so an old stack
+//                      line naming it keeps working.
 //   services=a,b       which PAM services it acts for (default phosh)
 //   quiet              no message to the front end - phosh cannot show one
 //                      and logs "conversation failed" for every attempt
@@ -50,12 +59,15 @@
 #include <security/pam_modules.h>
 
 #define MAX_STEPS 16
+/* Ceiling for the doubling - one year. Not a policy (twenty-odd locks in,
+ * the PIN has been tried about sixty times); it keeps lock_start + lock_len
+ * far from overflowing a long. */
+#define MAX_LOCK (365L * 24 * 3600)
 
 struct opts {
 	int preauth;
 	int quiet;
 	int deny;
-	long interval;
 	int nsteps;
 	long steps[MAX_STEPS];          /* seconds */
 	const char *services;
@@ -77,7 +89,6 @@ static void parse(int argc, const char **argv, struct opts *o)
 	o->preauth = 0;
 	o->quiet = 0;
 	o->deny = 3;
-	o->interval = 900;
 	o->services = "phosh";
 	o->dir = NULL;
 	o->nsteps = sizeof(dflt) / sizeof(dflt[0]);
@@ -95,9 +106,7 @@ static void parse(int argc, const char **argv, struct opts *o)
 			if (n > 0)
 				o->deny = n;
 		} else if (strncmp(a, "interval=", 9) == 0) {
-			long n = atol(a + 9);
-			if (n > 0)
-				o->interval = n;
+			/* ignored - see the header */
 		} else if (strncmp(a, "dir=", 4) == 0 && a[4] == '/') {
 			o->dir = a + 4;
 		} else if (strncmp(a, "services=", 9) == 0) {
@@ -111,6 +120,8 @@ static void parse(int argc, const char **argv, struct opts *o)
 				long m = strtol(p, &end, 10);
 				if (end == p || m <= 0)
 					break;
+				if (m > MAX_LOCK / 60)
+					m = MAX_LOCK / 60;
 				v[n++] = m * 60;
 				p = (*end == ',') ? end + 1 : end;
 				if (*end != ',')
@@ -124,6 +135,20 @@ static void parse(int argc, const char **argv, struct opts *o)
 			}
 		}
 	}
+}
+
+/* The length of lock number strikes+1: the schedule, then the last step
+ * doubled for every lock beyond it, saturating at MAX_LOCK. */
+static long lock_length(const struct opts *o, long strikes)
+{
+	long len;
+
+	if (strikes < o->nsteps)
+		return o->steps[strikes] < MAX_LOCK ? o->steps[strikes] : MAX_LOCK;
+	len = o->steps[o->nsteps - 1];
+	for (long k = strikes - (o->nsteps - 1); k > 0 && len < MAX_LOCK; k--)
+		len *= 2;
+	return len < MAX_LOCK ? len : MAX_LOCK;
 }
 
 static int service_listed(const char *list, const char *svc)
@@ -294,15 +319,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 		s.lock_len = 0;
 	}
 
-	/* Failures too far apart are not an attack on the PIN. */
-	if (s.pending > 0 && now - s.last > o.interval)
-		s.pending = 0;
-
+	/* No forgetting with time: failures far apart are still failures,
+	 * and only pam_sm_acct_mgmt - a correct PIN - clears them. */
 	if (s.pending >= o.deny) {
-		int i = s.strikes < o.nsteps ? (int)s.strikes : o.nsteps - 1;
 		/* The lock runs from the last failure, not from this attempt. */
 		s.lock_start = (s.last > 0 && s.last <= now) ? s.last : now;
-		s.lock_len = o.steps[i];
+		s.lock_len = lock_length(&o, s.strikes);
 		s.strikes++;
 		s.pending = 0;
 		pam_syslog(pamh, LOG_NOTICE,

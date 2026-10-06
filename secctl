@@ -15,8 +15,9 @@ whole of what this program does:
             is reachable from the local network and not from the carrier's
 
   lockout   the phosh lock screen locks itself after 3 wrong PINs - 5
-            minutes, then 10, 15, 30, 60 and longer - so a PIN cannot be
-            guessed through in an afternoon
+            minutes, then 10, 15, 30, 60 and longer, doubling past 8 hours
+            and never forgetting a failure until the right PIN - so a PIN
+            cannot be guessed through, quickly or slowly
 
 Not one of those fixes a vulnerability. They make the cheap paths to one
 expensive. What is left after all
@@ -1303,7 +1304,8 @@ def status(as_json=False):
     lo = parts["lockout"]
     schedule = ", ".join(str(m) for m in lo["schedule"])
     if lo["state"] == "on":
-        rep.ok("lock screen: 3 wrong PINs lock it for %s min" % schedule)
+        rep.ok("lock screen: 3 wrong PINs lock it for %s min, then doubling"
+               % schedule)
     elif lo["state"] == "partial":
         rep.bad("in the PAM stack, but the module is not installed - run install.sh"
                 if not lo["module"] else "half in place", part="lockout")

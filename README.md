@@ -15,7 +15,7 @@ Each switches on its own, each goes away again cleanly.
 | `sysctl` | unprivileged BPF off, JIT hardened, `dmesg` and kernel pointers closed, `ptrace` limited to one's own children |
 | `modules` | the kernel stops auto-loading 14 protocol families, line disciplines and filesystems that nothing here uses |
 | `firewall` | one nftables input chain with a default of **drop** — what listens on this phone is reachable from the home network, not from the carrier's |
-| `lockout` | the phosh lock screen locks itself after 3 wrong PINs: 5 min, then 10, 15, 30, 60, 120, 240 and 480 from then on; a correct PIN starts over |
+| `lockout` | the phosh lock screen locks itself after 3 wrong PINs: 5 min, then 10, 15, 30, 60, 120, 240, 480, and from there each lock twice the last (ceiling one year); failures are never forgotten with time, only a correct PIN starts over |
 
 Not one of them fixes a vulnerability. They make the cheap paths to one
 expensive.
@@ -35,6 +35,11 @@ any process on the phone could pull in a driver nobody has audited in years.
 service `phosh`; sudo, SSH and polkit pass through untouched. Every attempt is
 counted before the PIN is checked and cleared once the account stack runs,
 which phosh reaches only after a correct PIN.
+
+Nothing is forgotten because time passed. Earlier versions dropped failures
+more than 15 minutes apart, so three guesses every quarter hour never reached
+a longer lock; now a slow guesser climbs the same ladder as a fast one. The
+old `interval=` argument is still accepted and ignored.
 
 It fails open: an unreadable state, another user, anything it does not
 understand, and it steps aside. `secctl apply lockout` loads the module first
