@@ -301,6 +301,37 @@ class FirewallText(Base):
         self.set_lan()
         self.assertIn("ipv6-icmp", self.s.firewall_text())
 
+    def test_the_hotspot_is_not_trusted(self):
+        """ap0's clients are strangers: no blanket accept, only DHCP and DNS."""
+        self.set_lan()
+        text = self.s.firewall_text()
+        self.assertNotIn('"ap0" }', text)
+        for line in text.splitlines():
+            if '"ap0"' in line and "accept" in line:
+                self.assertIn("dport", line)
+                self.assertNotRegex(line, r"\b22\b")
+        self.assertIn('iifname "ap0" udp dport { 53, 67, 547 } accept', text)
+        self.assertIn('iifname "ap0" tcp dport 53 accept', text)
+
+    def test_the_container_bridge_stays_open(self):
+        self.set_lan()
+        self.assertIn('iifname "lxcbr0" accept', self.s.firewall_text())
+
+    def test_ssh_rule_never_binds_to_the_hotspot(self):
+        cfg = self.s.config()
+        cfg["lan"], cfg["iface"] = "10.42.0.0/24", "ap0"
+        self.s.write_file(self.s.CONFIG_FILE, json.dumps(cfg))
+        text = self.s.firewall_text()
+        self.assertNotIn("dport 22", text)
+        self.assertNotIn("dport 5353", text)
+
+    def test_no_forward_chain_is_ours(self):
+        """Hotspot NAT and forwarding belong to NetworkManager's tables."""
+        self.set_lan()
+        text = self.s.firewall_text()
+        self.assertNotIn("hook forward", text)
+        self.assertNotIn("nat", text)
+
 
 class FirewallApply(Base):
     def test_it_refuses_without_a_home_network(self):

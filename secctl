@@ -920,12 +920,22 @@ def firewall_text(cfg=None):
            "\t\t# and IPv6 stops working altogether",
            "\t\tmeta l4proto { icmp, ipv6-icmp } accept",
            "",
-           "\t\t# our own bridges: LXC, and the hotspot when it is up",
-           "\t\tiifname { \"lxcbr0\", \"ap0\" } accept",
+           "\t\t# the Android container's bridge - part of this phone",
+           "\t\tiifname \"lxcbr0\" accept",
+           "",
+           "\t\t# the hotspot: its clients are strangers, so they get what a",
+           "\t\t# hotspot needs from the phone - DHCP and DNS - and nothing",
+           "\t\t# else. Forwarding their traffic is not this chain's business.",
+           "\t\tiifname \"ap0\" udp dport { 53, 67, 547 } accept",
+           "\t\tiifname \"ap0\" tcp dport 53 accept",
            "",
            "\t\t# DHCP client, v4 and v6",
            "\t\tudp dport { 68, 546 } accept",
            ""]
+    # The home network is never the hotspot: a "lan" rule bound to ap0 would
+    # hand SSH to whoever joined it.
+    if iface == "ap0":
+        lan = ""
     if lan and cfg.get("allow_ssh"):
         out += ["\t\t# SSH from the home network only - never over mobile",
                 "\t\tiifname \"%s\" ip saddr %s tcp dport 22 accept" % (iface, lan),
